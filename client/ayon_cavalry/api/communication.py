@@ -82,6 +82,7 @@ class CavalryServerTool:
         self._app.router.add_post("/result", self._handle_result)
         self._app.router.add_post("/heartbeat", self._handle_heartbeat)
         self._app.router.add_post("/tool", self._handle_tool)
+        self._app.router.add_post("/creators", self._handle_creators)
         self._app.router.add_get("/health", self._handle_health)
 
         self._server_thread = None
@@ -333,6 +334,28 @@ class CavalryServerTool:
             self._on_tool_request(tool_name, data)
 
         return web.json_response({"status": "ok"})
+
+    async def _handle_creators(self, request):
+        """Return available creators for the Create dialog dropdown."""
+        try:
+            from ayon_core.pipeline import registered_host
+            from ayon_core.pipeline.create import CreateContext
+
+            host = registered_host()
+            create_context = CreateContext(host)
+            create_context.reset()
+
+            creators = []
+            for creator in create_context.manual_creators.values():
+                identifier = getattr(creator, "identifier", None)
+                label = getattr(creator, "label", None)
+                if identifier and label:
+                    creators.append({"identifier": identifier, "label": label})
+
+            return web.json_response({"creators": creators})
+        except Exception as e:
+            log.warning("Failed to get creators: %s", e, exc_info=True)
+            return web.json_response({"creators": []})
 
     def set_tool_callback(self, callback):
         """Register a callback for when Cavalry requests a tool.

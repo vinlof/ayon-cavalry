@@ -898,23 +898,63 @@ function hasExactlyOneCompSelected() {
     return selectedComps.length === 1;
 }
 
+function showCreateDialog() {
+    var creators = [
+        {identifier: "render", label: "Render"},
+        {identifier: "sceneFragment", label: "Scene Fragment"}
+    ];
+    var productDropDown = new ui.DropDown();
+    productDropDown.setSize(200, 22);
+    for (var i = 0; i < creators.length; i++) {
+        productDropDown.addEntry(creators[i].label);
+    }
+    var variantEdit = ui.LineEdit();
+    variantEdit.setPlaceholder("Main");
+    variantEdit.setText("Main");
+    var dialog = new ui.Container();
+    dialog.setBackgroundColor("#373737");
+    dialog.setMinimumWidth(260);
+    dialog.setMinimumHeight(180);
+    var mainLayout = new ui.VLayout();
+    mainLayout.add(new ui.Label("Product type:"));
+    mainLayout.add(productDropDown);
+    mainLayout.add(new ui.Label("Variant:"));
+    mainLayout.add(variantEdit);
+    var createBtn = new ui.Button("Create");
+    var cancelBtn = new ui.Button("Cancel");
+    var btnLayout = new ui.HLayout();
+    btnLayout.addStretch();
+    btnLayout.add(cancelBtn);
+    btnLayout.add(createBtn);
+    mainLayout.add(btnLayout);
+    mainLayout.setMargins(8, 8, 8, 8);
+    dialog.setLayout(mainLayout);
+    createBtn.onClick = function () {
+        var idx = productDropDown.getValue();
+        var creatorId = (creators[idx] && creators[idx].identifier) || "render";
+        var variant = (variantEdit.getText() || "Main").toString().trim() || "Main";
+        getPythonClient().post(
+            "/tool",
+            JSON.stringify({
+                tool: "creator",
+                creator_identifier: creatorId,
+                variant: variant
+            }),
+            "application/json"
+        );
+        dialog.close();
+    };
+    cancelBtn.onClick = function () { dialog.close(); };
+    dialog.show();
+}
+
 function openTool(toolName, extraPayload) {
     try {
         var payload = extraPayload || {tool: toolName};
         if (!payload.tool) payload.tool = toolName;
         if (toolName === "creator" && hasExactlyOneCompSelected()) {
-            var modal = new ui.Modal();
-            var variant = modal.showStringInput(
-                "Create Render Instance",
-                "Variant:",
-                "Main"
-            );
-            // Treat null, undefined, false, or empty string as cancel
-            if (variant === null || variant === undefined || variant === false ||
-                (typeof variant === "string" && variant.trim() === "")) {
-                return;
-            }
-            payload.variant = (variant || "Main").toString().trim() || "Main";
+            showCreateDialog();
+            return;
         }
         var client = getPythonClient();
         client.post("/tool", JSON.stringify(payload), "application/json");

@@ -61,10 +61,24 @@ def main(*subprocess_args):
     sys.exit(app.exec_())
 
 
-def try_direct_create_from_selection(variant="Main"):
-    """Create a render instance directly if exactly one composition is selected.
+def _get_pre_create_data_for_creator(creator_identifier):
+    """Return pre_create_data dict for the given creator."""
+    base = {
+        "use_selection": True,
+        "use_composition_name": False,
+    }
+    if creator_identifier == "render":
+        base["render_target"] = "local"
+        base["mark_for_review"] = False
+    return base
+
+
+def try_direct_create_from_selection(creator_identifier="render", variant="Main"):
+    """Create an instance directly if exactly one composition is selected.
 
     Args:
+        creator_identifier (str): Creator plugin identifier (e.g. "render",
+            "sceneFragment"). Default "render".
         variant (str): Product variant name (default "Main").
 
     Returns:
@@ -104,18 +118,19 @@ def try_direct_create_from_selection(variant="Main"):
         create_context = CreateContext(host)
         create_context.reset()
 
+        pre_create_data = _get_pre_create_data_for_creator(creator_identifier)
+
         create_context.create(
-            creator_identifier="render",
+            creator_identifier=creator_identifier,
             variant=variant,
-            pre_create_data={
-                "use_selection": True,
-                "use_composition_name": False,
-                "render_target": "local",
-                "mark_for_review": False,
-            },
+            pre_create_data=pre_create_data,
         )
 
-        log.info("Created render instance for composition: %s", comp_name)
+        log.info(
+            "Created %s instance for composition: %s",
+            creator_identifier,
+            comp_name,
+        )
         return True
 
     except CreatorError as e:
@@ -164,8 +179,12 @@ def show_tool_by_name(tool_name, tool_data=None):
     if tool_name == "loader":
         kwargs["use_context"] = True
     elif tool_name == "creator":
+        creator_id = tool_data.get("creator_identifier")
         variant = tool_data.get("variant", "Main")
-        if try_direct_create_from_selection(variant=variant):
+        if creator_id and try_direct_create_from_selection(
+            creator_identifier=creator_id,
+            variant=variant,
+        ):
             return
         # AYON has no standalone "creator" tool; Create tab lives in Publisher
         tool_name = "publisher"
