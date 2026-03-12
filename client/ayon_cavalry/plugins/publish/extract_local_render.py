@@ -30,6 +30,9 @@ class ExtractLocalRender(publish.Extractor):
     families = ["render.local"]
 
     def process(self, instance):
+        if instance.data.get("creator_attributes", {}).get("multi_comp"):
+            return
+
         stub = get_stub()
         rq_item_id = instance.data.get("__layer_id__")
         if not rq_item_id:

@@ -329,6 +329,52 @@ function executeCommand(cmd) {
                 break;
             }
 
+            case "get_comps_in_layer": {
+                var layerId = cmd.args.layer_id;
+                var compIds = api.getComps();
+                var compIdsSet = {};
+                for (var ci = 0; ci < compIds.length; ci++) {
+                    compIdsSet[compIds[ci]] = true;
+                }
+                var found = [];
+                if (compIdsSet[layerId]) {
+                    found.push(layerId);
+                } else {
+                    var layerType = (api.getLayerType(layerId) || "").toLowerCase();
+                    if (layerType.indexOf("group") !== -1 ||
+                        layerType.indexOf("folder") !== -1 ||
+                        layerType.indexOf("comp") !== -1) {
+                        try {
+                            var allLayers = api.getAssetWindowLayers(false);
+                            for (var li = 0; li < allLayers.length; li++) {
+                                var lid = allLayers[li];
+                                if (compIdsSet[lid]) {
+                                    try {
+                                        var parent = api.getParentComp ? api.getParentComp(lid) : null;
+                                        if (parent === layerId) {
+                                            found.push(lid);
+                                        }
+                                    } catch (e) {}
+                                }
+                            }
+                            if (found.length === 0 && api.getCompLayers) {
+                                try {
+                                    api.setActiveComp(layerId);
+                                    var childIds = api.getCompLayers(false);
+                                    for (var cj = 0; cj < childIds.length; cj++) {
+                                        if (compIdsSet[childIds[cj]]) {
+                                            found.push(childIds[cj]);
+                                        }
+                                    }
+                                } catch (e) {}
+                            }
+                        } catch (e) {}
+                    }
+                }
+                result = {success: true, comp_ids: found};
+                break;
+            }
+
             // ----- Assets -----
 
             case "load_asset": {
@@ -510,6 +556,45 @@ function executeCommand(cmd) {
                 var imprintData = cmd.args.data || {};
                 var renderPath = (cmd.args.path || "").replace(/\\/g, "/");
                 var rqId = api.addRenderQueueItem(compId);
+                if (renderPath) {
+                    try {
+                        api.set(rqId, {filePath: renderPath});
+                    } catch (e) {}
+                }
+                imprintData.__layer_id__ = rqId;
+                var key = (cmd.args.key === "ayon_context") ? AYON_CONTEXT_KEY : AYON_DATA_KEY;
+                api.setUserData(rqId, key, JSON.stringify(imprintData));
+                result = {success: true, item_id: rqId};
+                break;
+            }
+
+            case "create_rq_item_multi_comp_and_imprint": {
+                var compIds = cmd.args.comp_ids || [];
+                if (!Array.isArray(compIds)) {
+                    compIds = compIds != null ? [compIds] : [];
+                }
+                var imprintData = cmd.args.data || {};
+                var renderPath = (cmd.args.path || "").replace(/\\/g, "/");
+                if (compIds.length === 0) {
+                    result = {success: false, item_id: "", error: "No comp_ids"};
+                    break;
+                }
+                // Create 1 RQ item with first comp (sets targets.0)
+                var rqId = api.addRenderQueueItem(compIds[0]);
+                // Expand targets array with api.addArrayIndex (Cavalry API for array attributes)
+                // then connect each comp to targets.N.id
+                if (compIds.length > 1) {
+                    try {
+                        for (var si = 1; si < compIds.length; si++) {
+                            api.addArrayIndex(rqId, "targets");
+                        }
+                        for (var mi = 0; mi < compIds.length; mi++) {
+                            api.connect(compIds[mi], "id", rqId, "targets." + mi + ".id");
+                        }
+                    } catch (e) {
+                        console.warn("AYON: Could not add multi-comp targets: " + e);
+                    }
+                }
                 if (renderPath) {
                     try {
                         api.set(rqId, {filePath: renderPath});

@@ -74,7 +74,12 @@ def _get_pre_create_data_for_creator(creator_identifier):
 
 
 def try_direct_create_from_selection(creator_identifier="render", variant="Main"):
-    """Create an instance directly if exactly one composition is selected.
+    """Create an instance directly from selection.
+
+    - 1 comp: single comp instance
+    - 2+ comps: multi-comp instance (direct create)
+    - 1+ groups: multi-comp from comps in groups
+    - Mixed (comps + groups): show warning, open Publisher
 
     Args:
         creator_identifier (str): Creator plugin identifier (e.g. "render",
@@ -91,45 +96,86 @@ def try_direct_create_from_selection(creator_identifier="render", variant="Main"
         if not stub or not stub.is_connected:
             return False
 
+        if creator_identifier != "render":
+            selected_comps = _get_selected_comps(stub)
+            if len(selected_comps) != 1:
+                return False
+            return _do_direct_create(
+                creator_identifier, variant, stub, selected_comps
+            )
+
         ctx = stub.get_create_context()
         selection = ctx["selection"]
         comps = ctx["comps"]
         comp_ids = {c["id"] for c in comps}
+        comp_by_id = {c["id"]: c for c in comps}
 
-        # Filter selection to compositions only
-        selected_comps = [
+        selected_comp_items = [
             item for item in selection
             if item.get("id") in comp_ids
         ]
-        if not selected_comps:
-            selected_comps = [
+        if not selected_comp_items:
+            selected_comp_items = [
                 item for item in selection
                 if "comp" in item.get("type", "").lower()
             ]
 
-        if len(selected_comps) != 1:
+        selected_non_comp_items = [
+            item for item in selection
+            if item.get("id") not in comp_ids
+        ]
+
+        comp_ids_from_groups = []
+        for item in selected_non_comp_items:
+            comp_ids_from_groups.extend(
+                stub.get_comps_in_layer(item.get("id"))
+            )
+
+        if selected_comp_items and selected_non_comp_items:
+            _show_mixed_selection_warning()
             return False
 
-        comp = selected_comps[0]
-        comp_name = comp.get("name", "composition")
-        variant = (variant or "Main").strip() or "Main"
+        if not selected_comp_items and not comp_ids_from_groups:
+            return False
 
+        variant = (variant or "Main").strip() or "Main"
         host = registered_host()
         create_context = CreateContext(host)
         create_context.reset()
 
         pre_create_data = _get_pre_create_data_for_creator(creator_identifier)
 
+        if len(selected_comp_items) == 1:
+            create_context.create(
+                creator_identifier=creator_identifier,
+                variant=variant,
+                pre_create_data=pre_create_data,
+            )
+            log.info(
+                "Created %s instance for composition: %s",
+                creator_identifier,
+                selected_comp_items[0].get("name", "composition"),
+            )
+            return True
+
+        seen_ids = set()
+        for cid in comp_ids_from_groups:
+            seen_ids.add(cid)
+        for item in selected_comp_items:
+            seen_ids.add(item.get("id"))
+
+        if len(seen_ids) < 2:
+            return False
+
         create_context.create(
             creator_identifier=creator_identifier,
             variant=variant,
             pre_create_data=pre_create_data,
         )
-
         log.info(
-            "Created %s instance for composition: %s",
+            "Created multi-comp %s instance for %d compositions",
             creator_identifier,
-            comp_name,
+            len(seen_ids),
         )
         return True
 
@@ -139,6 +185,62 @@ def try_direct_create_from_selection(creator_identifier="render", variant="Main"
     except Exception:
         log.debug("Direct create failed", exc_info=True)
         return False
+
+
+def _get_selected_comps(stub):
+    """Return list of selected composition items."""
+    ctx = stub.get_create_context()
+    selection = ctx["selection"]
+    comps = ctx["comps"]
+    comp_ids = {c["id"] for c in comps}
+    selected = [
+        item for item in selection
+        if item.get("id") in comp_ids
+    ]
+    if not selected:
+        selected = [
+            item for item in selection
+            if "comp" in item.get("type", "").lower()
+        ]
+    return selected
+
+
+def _do_direct_create(creator_identifier, variant, stub, selected_comps):
+    """Perform direct create for single-comp creators."""
+    from ayon_core.pipeline import registered_host
+
+    comp = selected_comps[0]
+    variant = (variant or "Main").strip() or "Main"
+    host = registered_host()
+    create_context = CreateContext(host)
+    create_context.reset()
+    pre_create_data = _get_pre_create_data_for_creator(creator_identifier)
+    create_context.create(
+        creator_identifier=creator_identifier,
+        variant=variant,
+        pre_create_data=pre_create_data,
+    )
+    log.info(
+        "Created %s instance for composition: %s",
+        creator_identifier,
+        comp.get("name", "composition"),
+    )
+    return True
+
+
+def _show_mixed_selection_warning():
+    """Show warning that mixed selection is invalid."""
+    app = get_ayon_qt_app()
+    box = QtWidgets.QMessageBox()
+    box.setWindowFlags(
+        box.windowFlags() | QtCore.Qt.WindowStaysOnTopHint
+    )
+    box.setIcon(QtWidgets.QMessageBox.Warning)
+    box.setWindowTitle("AYON")
+    box.setText(
+        "Select either 1 comp, multiple comps, or a group—not a mix."
+    )
+    box.exec_()
 
 
 def _run_apply_settings(frames=True, resolution=True):

@@ -31,6 +31,9 @@ class CollectCavalryRender(pyblish.api.InstancePlugin):
             self.log.warning("Render instance has no composition members")
             return
 
+        if len(members) > 1:
+            return
+
         comp_id = members[0]
 
         comp_settings = stub.get_comp_settings(comp_id)

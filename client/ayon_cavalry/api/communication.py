@@ -514,6 +514,20 @@ class CavalryServerTool:
         result = self.send_command("get_comp_layers", args)
         return result.get("layers", [])
 
+    def get_comps_in_layer(self, layer_id):
+        """Return composition IDs under a layer (comp or group/folder).
+
+        If layer_id is a composition, returns [layer_id].
+        If layer_id is a group/folder, returns comp IDs of descendants.
+
+        Returns:
+            list[str]: Composition IDs.
+        """
+        result = self.send_command("get_comps_in_layer", {
+            "layer_id": str(layer_id),
+        })
+        return result.get("comp_ids", [])
+
     # -- Assets --
 
     def load_asset(self, path, is_sequence=False):
@@ -654,6 +668,29 @@ class CavalryServerTool:
         if key:
             args["key"] = key
         result = self.send_command("create_rq_item_and_imprint", args)
+        return result.get("item_id", "")
+
+    def create_rq_item_multi_comp_and_imprint(self, comp_ids, data, path=None, key=None):
+        """Add one RQ item with multiple compositions as targets, set path, imprint.
+
+        Uses addRenderQueueItem(first_comp) then api.connect(comp, "id", rqId,
+        "targets.N.id") for remaining comps (from scene file analysis).
+
+        Args:
+            comp_ids (list[str]): Composition IDs.
+            data (dict): Instance/container data to imprint.
+            path (str, optional): Render output directory (forward slashes).
+            key (str, optional): "ayon_context" for context data.
+
+        Returns:
+            str: Render Queue Item ID (single item with all comps as targets).
+        """
+        args = {"comp_ids": [str(c) for c in comp_ids], "data": data}
+        if path:
+            args["path"] = path.replace("\\", "/")
+        if key:
+            args["key"] = key
+        result = self.send_command("create_rq_item_multi_comp_and_imprint", args)
         return result.get("item_id", "")
 
     def render(self, item_id, timeout=300):

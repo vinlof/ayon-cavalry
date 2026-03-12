@@ -26,6 +26,12 @@ def _get_render_dir_from_workfile(workfile_path):
     ).replace("\\", "/")
 
 
+def _sanitize_comp_name(name):
+    """Sanitize comp name for representation and filesystem."""
+    sanitized = re.sub(r"[^\w\-]", "_", name).strip("_")
+    return sanitized or "comp"
+
+
 class RenderCreator(Creator):
     """Creates 'render' instance for publishing.
 
@@ -64,20 +70,11 @@ class RenderCreator(Creator):
             )
         all_comps = ctx["comps"]
         all_comp_ids = {c["id"] for c in all_comps}
+        comp_by_id = {c["id"]: c for c in all_comps}
 
-        if pre_create_data.get("use_selection"):
-            sel = ctx["selection"]
-            comps = [
-                item for item in sel
-                if item.get("id") in all_comp_ids
-            ]
-            if not comps:
-                comps = [
-                    item for item in sel
-                    if "comp" in item.get("type", "").lower()
-                ]
-        else:
-            comps = all_comps
+        comps = self._resolve_comps_from_selection(
+            ctx, all_comps, all_comp_ids, comp_by_id, pre_create_data, stub
+        )
 
         if not comps:
             raise CreatorError(
@@ -89,6 +86,12 @@ class RenderCreator(Creator):
         render_dir = _get_render_dir_from_workfile(workfile_path)
         if render_dir:
             os.makedirs(render_dir, exist_ok=True)
+
+        if len(comps) > 1:
+            self._create_multi_comp_instance(
+                comps, product_name, data, render_dir, ctx, pre_create_data, stub
+            )
+            return
 
         use_composition_name = (
             pre_create_data.get("use_composition_name")
@@ -213,6 +216,117 @@ class RenderCreator(Creator):
             new_instance.data["__layer_id__"] = rq_item_id
             self._add_instance_to_context(new_instance)
 
+    def _resolve_comps_from_selection(
+        self, ctx, all_comps, all_comp_ids, comp_by_id, pre_create_data, stub
+    ):
+        """Resolve comp list from selection. Raises CreatorError on mixed selection."""
+        if not pre_create_data.get("use_selection"):
+            return all_comps
+
+        sel = ctx["selection"]
+        selected_comp_items = [
+            item for item in sel
+            if item.get("id") in all_comp_ids
+        ]
+        if not selected_comp_items:
+            selected_comp_items = [
+                item for item in sel
+                if "comp" in item.get("type", "").lower()
+            ]
+
+        selected_non_comp_items = [
+            item for item in sel
+            if item.get("id") not in all_comp_ids
+        ]
+
+        comp_ids_from_groups = []
+        for item in selected_non_comp_items:
+            comp_ids_from_groups.extend(
+                stub.get_comps_in_layer(item.get("id"))
+            )
+
+        if selected_comp_items and selected_non_comp_items:
+            raise CreatorError(
+                "Select either 1 comp, multiple comps, or a group—not a mix."
+            )
+
+        if selected_comp_items:
+            return selected_comp_items
+        if comp_ids_from_groups:
+            seen = set()
+            unique_ids = []
+            for cid in comp_ids_from_groups:
+                if cid not in seen:
+                    seen.add(cid)
+                    unique_ids.append(cid)
+            return [
+                comp_by_id.get(cid, {"id": cid, "name": str(cid)})
+                for cid in unique_ids
+            ]
+
+        return all_comps
+
+    def _create_multi_comp_instance(
+        self, comps, product_name, data, render_dir, ctx, pre_create_data, stub
+    ):
+        """Create one instance with multiple comps (multi-representation)."""
+        product_name = re.sub(
+            r"\{composition\}",
+            "",
+            product_name,
+            flags=re.IGNORECASE,
+        ).strip()
+
+        mark_review = pre_create_data.get("mark_for_review", "first")
+        creator_attributes = {
+            "render_target": pre_create_data.get("render_target", "local"),
+            "mark_for_review": mark_review != "none",
+            "mark_for_review_mode": mark_review,
+            "format": pre_create_data.get("format", ""),
+            "multi_comp": True,
+        }
+
+        metadata_items = ctx.get("items", [])
+        existing_names = {
+            inst.get("productName", "")
+            for inst in metadata_items
+            if inst.get("id") in {AYON_INSTANCE_ID, AVALON_INSTANCE_ID}
+            and inst.get("creator_identifier") == self.identifier
+        }
+        base_name = product_name or "renderMain"
+        counter = 1
+        product_name = base_name
+        while product_name in existing_names:
+            product_name = "{}{}".format(base_name, counter)
+            counter += 1
+
+        members = [c["id"] for c in comps]
+        comp_members = [{"comp_id": c["id"], "comp_name": c.get("name", "")} for c in comps]
+
+        data_copy = dict(data)
+        data_copy["members"] = members
+        data_copy["comp_members"] = comp_members
+        data_copy["creator_attributes"] = creator_attributes
+
+        product_type = data_copy.get("productType") or self.product_base_type
+
+        new_instance = CreatedInstance(
+            product_base_type=self.product_base_type,
+            product_type=product_type,
+            product_name=product_name,
+            data=data_copy,
+            creator=self,
+        )
+
+        rq_item_id = stub.create_rq_item_multi_comp_and_imprint(
+            members, new_instance.data_to_store(), path=render_dir
+        )
+        new_instance.data["__layer_id__"] = rq_item_id
+        self._add_instance_to_context(new_instance)
+
+        if mark_review == "first" and comps:
+            new_instance.data["review"] = True
+
     def get_pre_create_attr_defs(self):
         return [
             BoolDef(
@@ -313,13 +427,20 @@ class RenderCreator(Creator):
             stub.set_comp_settings(comp_id=comp_id, **settings)
 
     def collect_instances(self):
+        seen_instance_ids = set()
         for instance_data in cache_and_get_instances(self):
             creator_id = instance_data.get("creator_identifier")
-            if creator_id == self.identifier:
-                instance = CreatedInstance.from_existing(
-                    instance_data, self
-                )
-                self._add_instance_to_context(instance)
+            if creator_id != self.identifier:
+                continue
+            instance_id = instance_data.get("instance_id")
+            if instance_id and instance_id in seen_instance_ids:
+                continue
+            if instance_id:
+                seen_instance_ids.add(instance_id)
+            instance = CreatedInstance.from_existing(
+                instance_data, self
+            )
+            self._add_instance_to_context(instance)
 
     def update_instances(self, update_list):
         stub = get_stub()
@@ -330,11 +451,12 @@ class RenderCreator(Creator):
             if layer_id:
                 stub.imprint(layer_id, created_inst.data_to_store())
 
-            name_change = _changes.get("productName")
-            if self.rename_comp_to_product_name and name_change:
-                member_id = created_inst.data.get("members", [None])[0]
-                if member_id:
-                    stub.rename_layer(member_id, name_change.new_value)
+            if not created_inst.data.get("creator_attributes", {}).get("multi_comp"):
+                name_change = _changes.get("productName")
+                if self.rename_comp_to_product_name and name_change:
+                    member_id = created_inst.data.get("members", [None])[0]
+                    if member_id:
+                        stub.rename_layer(member_id, name_change.new_value)
 
     def remove_instances(self, instances):
         stub = get_stub()
@@ -350,10 +472,11 @@ class RenderCreator(Creator):
                 if layer_id != comp_id:
                     stub.delete_layer(layer_id)
 
-            if self.rename_comp_to_product_name and comp_id:
-                orig_name = instance.data.get("orig_comp_name")
-                if orig_name:
-                    stub.rename_layer(comp_id, orig_name)
+            if not instance.data.get("creator_attributes", {}).get("multi_comp"):
+                if self.rename_comp_to_product_name and comp_id:
+                    orig_name = instance.data.get("orig_comp_name")
+                    if orig_name:
+                        stub.rename_layer(comp_id, orig_name)
 
     def get_dynamic_data(
         self,
