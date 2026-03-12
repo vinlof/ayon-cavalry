@@ -1,0 +1,6 @@
+[project]
+name = "cavalry"
+description = "AYON Cavalry addon."
+
+[ayon.runtimeDependencies]
+aiohttp = ">=3.9.0"

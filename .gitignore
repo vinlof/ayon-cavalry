@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+
+# Packaging output
+package/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.cursor/
+
+# Plans / working notes (not versioned)
+plans/
+
+# OS
+.DS_Store
+Thumbs.db

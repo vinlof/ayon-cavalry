@@ -1,0 +1,77 @@
+from ayon_server.settings import BaseSettingsModel, SettingsField
+
+
+class CavalryCreatorSettings(BaseSettingsModel):
+    """Settings for Cavalry creators."""
+
+    rename_comp_to_product_name: bool = SettingsField(
+        True,
+        title="Rename Composition to Product Name",
+        description=(
+            "When creating a render instance, rename the source composition "
+            "to match the product name."
+        ),
+    )
+    force_setting_values: bool = SettingsField(
+        False,
+        title="Force Settings from AYON",
+        description=(
+            "Force fps, frame range and resolution of the composition to "
+            "match the target publish context attributes when creating a render."
+        ),
+    )
+
+
+class CavalryPublishSettings(BaseSettingsModel):
+    """Settings for Cavalry publish plugins."""
+
+    validate_scene_settings: bool = SettingsField(
+        True,
+        title="Validate Scene Settings",
+        description=(
+            "Enable validation that checks composition settings against "
+            "AYON folder/task attributes before publishing."
+        ),
+    )
+    increment_workfile: bool = SettingsField(
+        True,
+        title="Increment Workfile on Publish",
+        description=(
+            "Automatically increment the workfile version after a "
+            "successful publish."
+        ),
+    )
+
+
+class CavalrySettings(BaseSettingsModel):
+    """Cavalry Project Settings."""
+
+    auto_install_script: bool = SettingsField(
+        True,
+        title="Install AYON Panel Script",
+        description=(
+            "Automatically copy the AYON panel script to the Cavalry"
+            " Scripts folder on launch."
+        ),
+    )
+    creator: CavalryCreatorSettings = SettingsField(
+        default_factory=CavalryCreatorSettings,
+        title="Creator Settings",
+    )
+    publish: CavalryPublishSettings = SettingsField(
+        default_factory=CavalryPublishSettings,
+        title="Publish Settings",
+    )
+
+
+DEFAULT_CAVALRY_SETTING = {
+    "auto_install_script": True,
+    "creator": {
+        "rename_comp_to_product_name": True,
+        "force_setting_values": False,
+    },
+    "publish": {
+        "validate_scene_settings": True,
+        "increment_workfile": True,
+    },
+}
