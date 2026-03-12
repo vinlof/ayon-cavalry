@@ -1,10 +1,12 @@
 """Pre-launch hook to install the AYON panel script into Cavalry.
 
 Copies ayon_panel.js to the Cavalry Scripts folder so it appears in
-Cavalry's Window > Scripts > AYON menu.
+Cavalry's Window > Scripts > AYON menu. Also installs custom script
+locations from project settings.
 """
 
 import os
+import re
 import shutil
 from pathlib import Path
 
@@ -12,6 +14,12 @@ import platformdirs
 
 from ayon_cavalry import CAVALRY_ADDON_ROOT
 from ayon_applications import PreLaunchHook, LaunchTypes
+
+
+def _sanitize_subfolder_name(name: str) -> str:
+    """Remove path separators and invalid chars from subfolder name."""
+    sanitized = re.sub(r'[/\\:*?"<>|]', "_", name)
+    return sanitized.strip() or "Custom"
 
 
 class InstallAyonScriptToCavalry(PreLaunchHook):
@@ -28,19 +36,27 @@ class InstallAyonScriptToCavalry(PreLaunchHook):
     def execute(self):
         try:
             settings = self.data["project_settings"]["cavalry"]
-            if not settings.get("auto_install_script", True):
-                self.log.debug(
-                    "Auto-install of AYON panel script is disabled."
-                )
-                return
         except (KeyError, TypeError):
-            pass
+            settings = {}
+
+        if settings.get("auto_install_script", True):
+            try:
+                self._install_panel_script()
+            except Exception:
+                self.log.warning(
+                    "Failed to install AYON panel script to Cavalry.",
+                    exc_info=True,
+                )
+        else:
+            self.log.debug(
+                "Auto-install of AYON panel script is disabled."
+            )
 
         try:
-            self._install_panel_script()
+            self._install_custom_scripts(settings)
         except Exception:
             self.log.warning(
-                "Failed to install AYON panel script to Cavalry.",
+                "Failed to install custom scripts to Cavalry.",
                 exc_info=True,
             )
 
@@ -122,3 +138,82 @@ class InstallAyonScriptToCavalry(PreLaunchHook):
             self.log.info(
                 "AYON panel script installed to: %s", target_file
             )
+
+    def _install_custom_scripts(self, settings: dict) -> None:
+        """Install custom script locations to Cavalry Scripts (fresh install)."""
+        entries = settings.get("custom_script_locations") or []
+        if not entries:
+            return
+
+        scripts_root = Path(
+            platformdirs.user_data_dir(roaming=True),
+            "Cavalry", "Scripts"
+        )
+
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            source_path_raw = entry.get("source_path", "").strip()
+            if not source_path_raw:
+                self.log.debug("Skipping custom script: empty source path.")
+                continue
+
+            source_path = Path(
+                os.path.expandvars(os.path.expanduser(source_path_raw))
+            )
+            if not source_path.exists():
+                self.log.warning(
+                    "Custom script source does not exist, skipping: %s",
+                    source_path,
+                )
+                continue
+
+            target_subfolder_raw = entry.get("target_subfolder", "").strip()
+            if target_subfolder_raw:
+                target_subfolder = _sanitize_subfolder_name(
+                    target_subfolder_raw
+                )
+            else:
+                if source_path.is_file():
+                    target_subfolder = _sanitize_subfolder_name(
+                        source_path.stem
+                    )
+                else:
+                    target_subfolder = _sanitize_subfolder_name(
+                        source_path.name
+                    )
+
+            target_dir = scripts_root / target_subfolder
+
+            try:
+                if target_dir.exists():
+                    shutil.rmtree(target_dir)
+                target_dir.mkdir(parents=True, exist_ok=True)
+
+                if source_path.is_file():
+                    dest_file = target_dir / source_path.name
+                    shutil.copy2(str(source_path), str(dest_file))
+                    self.log.info(
+                        "Installed custom script: %s -> %s",
+                        source_path.name,
+                        target_dir,
+                    )
+                else:
+                    for item in source_path.iterdir():
+                        dest = target_dir / item.name
+                        if item.is_file():
+                            shutil.copy2(str(item), str(dest))
+                        elif item.is_dir():
+                            shutil.copytree(str(item), str(dest))
+                    self.log.info(
+                        "Installed custom script folder: %s -> %s",
+                        source_path,
+                        target_dir,
+                    )
+            except Exception:
+                self.log.warning(
+                    "Failed to install custom script from %s to %s",
+                    source_path,
+                    target_dir,
+                    exc_info=True,
+                )

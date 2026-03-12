@@ -431,6 +431,10 @@ class CavalryServerTool:
         """
         return self.send_command("get_active_comp")
 
+    def set_active_comp(self, comp_id):
+        """Set the currently active composition."""
+        self.send_command("set_active_comp", {"comp_id": str(comp_id)})
+
     def get_comp_settings(self, comp_id=None):
         """Get composition settings (resolution, fps, frame range).
 
@@ -570,6 +574,22 @@ class CavalryServerTool:
         """
         result = self.send_command("get_selection")
         return result.get("selection", [])
+
+    def select(self, layer_ids):
+        """Select the specified layers in the scene."""
+        self.send_command("select", {"layer_ids": list(layer_ids)})
+
+    def export_selected(self, path):
+        """Export selected (and connected) layers to a .cvc file.
+
+        Returns:
+            bool: True if export succeeded.
+        """
+        path = path.replace("\\", "/")
+        if not path.lower().endswith(".cvc"):
+            path = path + ".cvc"
+        result = self.send_command("export_selected", {"path": path})
+        return result.get("success", False)
 
     # -- Rendering --
 

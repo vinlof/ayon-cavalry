@@ -419,6 +419,23 @@ function executeCommand(cmd) {
                 break;
             }
 
+            case "select":
+                api.select(cmd.args.layer_ids || []);
+                result = {success: true};
+                break;
+
+            case "export_selected":
+                result = {
+                    success: api.exportSelected(cmd.args.path),
+                    path: cmd.args.path
+                };
+                break;
+
+            case "set_active_comp":
+                api.setActiveComp(cmd.args.comp_id);
+                result = {success: true};
+                break;
+
             case "get_create_context": {
                 var sel = api.getSelection();
                 var compIds = api.getComps();

@@ -242,7 +242,7 @@ def check_inventory():
     message_box.exec_()
 
 
-def containerise(name, namespace, layer_id, context, loader=None):
+def containerise(name, namespace, layer_id, context, loader=None, members=None):
     """Create a container entry on a Cavalry layer.
 
     Args:
@@ -251,6 +251,9 @@ def containerise(name, namespace, layer_id, context, loader=None):
         layer_id (str): Cavalry layer/asset ID to store container on.
         context (dict): Representation context from loader.
         loader (str, optional): Loader class name.
+        members (list, optional): Layer IDs that belong to this container.
+            If None, uses [layer_id]. Use for multi-member containers
+            (e.g. scene fragments with multiple imported layers).
 
     Returns:
         str: The layer_id that was containerised.
@@ -262,7 +265,7 @@ def containerise(name, namespace, layer_id, context, loader=None):
         "namespace": namespace,
         "loader": str(loader),
         "representation": context["representation"]["id"],
-        "members": [layer_id],
+        "members": members if members is not None else [layer_id],
     }
 
     stub = get_stub()

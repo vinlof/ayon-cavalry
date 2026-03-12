@@ -152,6 +152,19 @@ Loaded assets remain as footage layers in the Asset Window so they can be update
 
 Cavalry addon settings are available under Project Settings > Cavalry:
 
+**Install AYON Panel Script**
+
+- **Auto-install** — Automatically copy the AYON panel script to Cavalry's Scripts folder on launch (default: on).
+
+**Custom Script Locations**
+
+Add custom script locations that are installed into Cavalry's Scripts folder when launching via AYON. Each entry is installed fresh (target cleared first) so Cavalry Scripts always match the source.
+
+- **Source Path** — Path to a script file or folder. Supports environment variables: `${VAR}` or `$VAR`. Examples: `C:\Studio\Scripts`, `${STUDIO_SCRIPTS}/cavalry`
+- **Menu Subfolder Name** — Name under `Window > Scripts` (e.g. `StudioTools`). If empty, uses the source file or folder name.
+
+Scripts appear in Cavalry under `Window > Scripts > [Subfolder Name]`.
+
 **Creator**
 
 - **Rename Composition to Product Name** — When creating a render instance, rename the source composition to match the product name.
