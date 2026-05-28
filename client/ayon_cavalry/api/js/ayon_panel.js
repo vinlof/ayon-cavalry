@@ -121,6 +121,135 @@ function _getRenderQueueItemPaths(itemId) {
     return info;
 }
 
+function dirnameFromScriptPath(scriptPath) {
+    var normalized = (scriptPath || "").replace(/\\/g, "/");
+    var lastSlash = normalized.lastIndexOf("/");
+    if (lastSlash <= 0) {
+        return normalized;
+    }
+    return normalized.substring(0, lastSlash);
+}
+
+function writeAyonBridgeFile(filePath, content) {
+    var normalized = String(filePath || "").replace(/\\/g, "/");
+    if (!normalized) {
+        throw new Error("Missing bridge file path.");
+    }
+    // Cavalry defaults overwriteExisting to false; bridge files must be replaced.
+    var ok = api.writeToFile(normalized, String(content), true);
+    if (!ok) {
+        throw new Error("Failed to write bridge file: " + normalized);
+    }
+    return normalized;
+}
+
+function stageScriptArgs(scriptPath, argsPath, payloadObj, commandId) {
+    var scriptDir = dirnameFromScriptPath(scriptPath);
+    var argsDest = scriptDir + "/._ayon_run_args.json";
+    var argsContent = null;
+
+    if (payloadObj !== undefined && payloadObj !== null) {
+        var stagedPayload = JSON.parse(JSON.stringify(payloadObj));
+        if (commandId) {
+            stagedPayload.command_id = commandId;
+        }
+        argsContent = JSON.stringify(stagedPayload);
+    } else if (argsPath && api.filePathExists(argsPath)) {
+        argsContent = api.readFromFile(argsPath);
+    }
+
+    if (argsContent !== null) {
+        writeAyonBridgeFile(argsDest, argsContent);
+        writeAyonBridgeFile(scriptDir + "/._ayon_run_args_path.txt", argsDest);
+        if (typeof ui !== "undefined" && ui.scriptLocation) {
+            writeAyonBridgeFile(
+                ui.scriptLocation + "/._ayon_run_args_path.txt",
+                argsDest
+            );
+            var stalePanelArgs = ui.scriptLocation + "/._ayon_run_args.json";
+            if (api.filePathExists(stalePanelArgs)) {
+                api.deleteFilePath(stalePanelArgs);
+            }
+        }
+        if (commandId) {
+            writeAyonBridgeFile(scriptDir + "/._ayon_run_command_id.txt", commandId);
+            if (typeof ui !== "undefined" && ui.scriptLocation) {
+                writeAyonBridgeFile(
+                    ui.scriptLocation + "/._ayon_run_command_id.txt",
+                    commandId
+                );
+            }
+        }
+    }
+    return argsDest;
+}
+
+function stageRunScriptDir(scriptPath) {
+    var scriptDir = dirnameFromScriptPath(scriptPath);
+    try {
+        if (typeof globalThis !== "undefined") {
+            globalThis.__AYON_RUN_SCRIPT_DIR__ = scriptDir;
+        }
+    } catch (e) {}
+    writeAyonBridgeFile(scriptDir + "/._ayon_run_script_dir.txt", scriptDir);
+    if (typeof ui !== "undefined" && ui.scriptLocation) {
+        writeAyonBridgeFile(
+            ui.scriptLocation + "/._ayon_run_script_dir.txt",
+            scriptDir
+        );
+    }
+    return scriptDir;
+}
+
+function clearAyonScriptResult(scriptDir) {
+    try {
+        if (typeof globalThis !== "undefined") {
+            delete globalThis.__AYON_LAST_SCRIPT_RESULT__;
+        }
+    } catch (e) {}
+    try {
+        if (typeof AYON_LAST_SCRIPT_RESULT !== "undefined") {
+            AYON_LAST_SCRIPT_RESULT = undefined;
+        }
+    } catch (e2) {}
+    if (scriptDir) {
+        try {
+            var resultPath = scriptDir + "/._ayon_run_result.json";
+            if (api.filePathExists(resultPath)) {
+                api.deleteFilePath(resultPath);
+            }
+        } catch (e3) {}
+    }
+}
+
+function readAyonScriptResult(scriptDir) {
+    var scriptResult = null;
+    if (scriptDir) {
+        try {
+            var resultPath = scriptDir + "/._ayon_run_result.json";
+            if (api.filePathExists(resultPath)) {
+                var fileResult = api.readFromFile(resultPath);
+                if (fileResult && String(fileResult).trim()) {
+                    scriptResult = fileResult;
+                }
+            }
+        } catch (eFile) {}
+    }
+    if (scriptResult === null) {
+        try {
+            if (typeof globalThis !== "undefined" && globalThis.__AYON_LAST_SCRIPT_RESULT__) {
+                scriptResult = globalThis.__AYON_LAST_SCRIPT_RESULT__;
+            } else if (typeof AYON_LAST_SCRIPT_RESULT !== "undefined") {
+                scriptResult = AYON_LAST_SCRIPT_RESULT;
+            }
+        } catch (e) {}
+    }
+    if (scriptResult !== null && typeof scriptResult !== "string") {
+        scriptResult = JSON.stringify(scriptResult);
+    }
+    return scriptResult;
+}
+
 function executeCommand(cmd) {
     var result = {};
     try {
@@ -795,6 +924,53 @@ function executeCommand(cmd) {
                     filePath: filePath,
                     tried: triedAttrs,
                     allAttrNames: allAttrs
+                };
+                break;
+            }
+
+            case "run_file_script": {
+                var scriptPath = (cmd.args.path || "").replace(/\\/g, "/");
+                var argsPath = (cmd.args.args_path || "").replace(/\\/g, "/");
+                var payloadObj = cmd.args.payload;
+                if (!scriptPath) {
+                    result = {success: false, error: "Missing script path"};
+                    break;
+                }
+                var scriptDir = null;
+                try {
+                    stageScriptArgs(scriptPath, argsPath, payloadObj, cmd.id);
+                    scriptDir = stageRunScriptDir(scriptPath);
+                } catch (e) {
+                    result = {
+                        success: false,
+                        error: "Could not stage script args: " + e
+                    };
+                    break;
+                }
+                clearAyonScriptResult(scriptDir);
+                try {
+                    ui.runFileScript(scriptPath);
+                } catch (eRun) {
+                    result = {
+                        success: false,
+                        error: String(eRun),
+                        script_path: scriptPath
+                    };
+                    break;
+                }
+                var scriptResult = readAyonScriptResult(scriptDir);
+                if (!scriptResult) {
+                    result = {
+                        success: false,
+                        error: "Script finished without returning a result payload.",
+                        script_path: scriptPath
+                    };
+                    break;
+                }
+                result = {
+                    success: true,
+                    script_path: scriptPath,
+                    script_result: scriptResult
                 };
                 break;
             }

@@ -716,6 +716,27 @@ class CavalryServerTool:
         """
         return self.send_command("render_all", timeout=timeout)
 
+    def run_file_script(self, path, args_path=None, payload=None, timeout=120):
+        """Execute a Cavalry script file with optional staged JSON args.
+
+        Args:
+            path (str): Absolute path to the script file to run.
+            args_path (str, optional): Path to a JSON file whose contents are
+                staged beside the target script before execution.
+            payload (dict, optional): JSON-serializable args dict staged beside
+                the target script before execution. Preferred over args_path.
+            timeout (int): Command timeout in seconds.
+
+        Returns:
+            dict: Command result including ``script_result`` as a JSON string.
+        """
+        args = {"path": str(path).replace("\\", "/")}
+        if args_path:
+            args["args_path"] = str(args_path).replace("\\", "/")
+        if payload is not None:
+            args["payload"] = payload
+        return self.send_command("run_file_script", args, timeout=timeout)
+
     def get_render_path(self):
         """Get the current render output directory.
 

@@ -139,6 +139,32 @@ class InstallAyonScriptToCavalry(PreLaunchHook):
                 "AYON panel script installed to: %s", target_file
             )
 
+        self._install_script_helper(source_dir, target_dir)
+
+    def _install_script_helper(self, source_dir: Path, target_dir: Path) -> None:
+        """Copy generic AYON script helpers beside the panel script."""
+        source_file = source_dir / "ayon_script_helpers.js"
+        if not source_file.exists():
+            self.log.warning(
+                "AYON script helpers not found at: %s", source_file
+            )
+            return
+
+        target_file = target_dir / "ayon_script_helpers.js"
+        source_content = source_file.read_text(encoding="utf-8")
+        if target_file.exists():
+            target_content = target_file.read_text(encoding="utf-8")
+            if source_content == target_content:
+                self.log.debug("AYON script helpers are already up to date.")
+                return
+            self.log.info("Updating AYON script helpers in Cavalry.")
+        else:
+            self.log.info("Installing AYON script helpers to Cavalry.")
+
+        target_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(str(source_file), str(target_file))
+        self.log.info("AYON script helpers installed to: %s", target_file)
+
     def _install_custom_scripts(self, settings: dict) -> None:
         """Install custom script locations to Cavalry Scripts (fresh install)."""
         entries = settings.get("custom_script_locations") or []
