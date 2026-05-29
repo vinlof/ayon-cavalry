@@ -1,7 +1,7 @@
 """Extract local render from Cavalry for multi-comp instances.
 
-One RQ item with multiple comp targets. Renders once; Cavalry outputs
-each comp (e.g. to subdirs via Dynamic Rendering). Collects and builds
+Renders each composition sequentially so the publisher can show per-comp
+progress. Collects outputs from comp-specific subdirectories and builds
 one representation per comp/output location.
 """
 
@@ -12,6 +12,7 @@ import time
 from ayon_core.pipeline import publish
 
 from ayon_cavalry.api import get_stub
+from ayon_cavalry.api.publish_progress import report_multi_comp_render_progress
 
 IMAGE_EXTS = {
     ".png", ".jpg", ".jpeg", ".exr", ".tiff", ".tif",
@@ -26,7 +27,7 @@ def _sanitize_comp_name(name):
 
 
 class ExtractMultiCompLocalRender(publish.Extractor):
-    """Render multi-comp RQ item (one item, multiple targets) and collect outputs."""
+    """Render multi-comp instance one comp at a time and collect outputs."""
 
     order = publish.Extractor.order - 0.46
     label = "Extract Multi-Comp Local Render"
@@ -47,6 +48,11 @@ class ExtractMultiCompLocalRender(publish.Extractor):
         members = instance.data.get("members", [])
         comp_settings = instance.data.get("comp_settings", {})
         comp_members = instance.data.get("comp_members", [])
+        if not comp_members and members:
+            comp_members = [
+                {"comp_id": comp_id, "comp_name": ""}
+                for comp_id in members
+            ]
 
         current_file = instance.context.data.get("currentFile", "")
         if not current_file:
@@ -67,98 +73,89 @@ class ExtractMultiCompLocalRender(publish.Extractor):
         os.makedirs(base_dir, exist_ok=True)
         stub.set_render_path(path=base_dir, item_id=rq_item_id)
 
-        pre_render_files = {}
-        for root, dirs, files in os.walk(base_dir):
-            pre_render_files[root] = set(files)
-
-        render_start = time.time()
-        stub.render(rq_item_id, timeout=600)
-        self.log.info("Render completed for multi-comp RQ item %s", rq_item_id)
-
-        subdir_to_files = {}
-        for root, _dirs, files in os.walk(base_dir):
-            for fname in files:
-                _, ext = os.path.splitext(fname)
-                if ext.lower() not in IMAGE_EXTS:
-                    continue
-                try:
-                    fpath = os.path.join(root, fname)
-                    mtime = os.path.getmtime(fpath)
-                    # Include files created or overwritten by this render
-                    if mtime < render_start - 2:
-                        continue
-                except OSError:
-                    continue
-                subdir_to_files.setdefault(root, []).append(fname)
+        creator_attributes = instance.data.get("creator_attributes", {})
+        mark_review = creator_attributes.get("mark_for_review_mode", "first")
+        total_comps = len(comp_members)
 
         representations = []
         used_repre_names = set()
-        creator_attributes = instance.data.get("creator_attributes", {})
-        mark_review = creator_attributes.get("mark_for_review_mode", "first")
-        comp_names = [m.get("comp_name", "") for m in comp_members]
 
-        for idx, (output_dir, files) in enumerate(sorted(subdir_to_files.items())):
-            if not files:
+        for idx, comp_member in enumerate(comp_members):
+            comp_index = idx + 1
+            comp_id = comp_member.get("comp_id") or (
+                members[idx] if idx < len(members) else None
+            )
+            comp_name = comp_member.get("comp_name", "")
+            if not comp_name and comp_id:
+                comp_name = comp_settings.get(comp_id, {}).get("name", "")
+
+            self.label = report_multi_comp_render_progress(
+                comp_index, total_comps
+            )
+
+            subdir_name = _sanitize_comp_name(comp_name) or "comp_{}".format(comp_index)
+            comp_output_dir = os.path.join(base_dir, subdir_name).replace("\\", "/")
+            os.makedirs(comp_output_dir, exist_ok=True)
+
+            if not comp_id:
+                self.log.warning(
+                    "Skipping comp %d/%d: missing comp id",
+                    comp_index,
+                    total_comps,
+                )
                 continue
-            subdir_name = os.path.basename(output_dir.rstrip(os.sep))
-            # Use subdir_name as base - Cavalry outputs unique subdirs per comp
-            # Fallback to comp_name only if subdir is generic (e.g. "0", "1")
-            comp_name = comp_names[idx] if idx < len(comp_names) else ""
-            if subdir_name and subdir_name not in ("0", "1", "2", "3"):
-                base_name = subdir_name
-            else:
-                base_name = comp_name or subdir_name or "comp_{}".format(idx + 1)
-            repre_name = _sanitize_comp_name(base_name)
-            if repre_name in used_repre_names:
-                repre_name = "{}_{}".format(repre_name, idx + 1)
-            used_repre_names.add(repre_name)
 
-            by_ext = {}
-            for fname in sorted(files):
-                ext = os.path.splitext(fname)[1][1:].lower()
-                by_ext.setdefault(ext, []).append(fname)
+            temp_rq_id = stub.add_render_queue_item(comp_id)
+            stub.set_render_path(path=comp_output_dir, item_id=temp_rq_id)
 
-            for ext, ext_files in by_ext.items():
-                resulting_files = ext_files[0] if len(ext_files) == 1 else ext_files
-                ext_repre = repre_name if len(by_ext) == 1 else "{}_{}".format(repre_name, ext)
-                if ext_repre in used_repre_names:
-                    ext_repre = "{}_{}".format(ext_repre, idx)
-                used_repre_names.add(ext_repre)
+            render_start = time.time()
+            stub.render(temp_rq_id, timeout=600)
+            self.log.info(
+                "Render completed for comp %s (%d/%d)",
+                comp_name or comp_id,
+                comp_index,
+                total_comps,
+            )
 
-                comp_id = members[idx] if idx < len(members) else None
-                settings = comp_settings.get(comp_id, {}) if comp_id else {}
-                repre_data = {
-                    "name": ext_repre,
-                    "ext": ext,
-                    "files": resulting_files,
-                    "stagingDir": output_dir,
-                    "outputName": ext_repre,
-                }
-                if isinstance(resulting_files, list):
-                    repre_data["frameStart"] = settings.get("frame_start")
-                    repre_data["frameEnd"] = settings.get("frame_end")
+            files = self._collect_new_render_files(comp_output_dir, render_start)
+            if not files:
+                self.log.warning(
+                    "No render output for comp %s in %s",
+                    comp_name or comp_id,
+                    comp_output_dir,
+                )
+                continue
 
-                if mark_review == "first" and not representations:
-                    repre_data["tags"] = ["review"]
-                elif mark_review == "all":
-                    repre_data["tags"] = ["review"]
-
-                representations.append(repre_data)
+            comp_representations = self._build_representations_for_files(
+                files=files,
+                output_dir=comp_output_dir,
+                base_name=subdir_name,
+                comp_id=comp_id,
+                comp_settings=comp_settings,
+                mark_review=mark_review,
+                used_repre_names=used_repre_names,
+                idx=idx,
+                has_existing_representations=bool(representations),
+            )
+            representations.extend(comp_representations)
 
         if not representations:
             self.log.warning(
                 "No render output in %s (version=%s). "
                 "Check that Cavalry wrote to the expected path.",
-                base_dir, version_str,
+                base_dir,
+                version_str,
             )
-            # Fallback: Cavalry may have written to RQ item's filePath
+            render_start = time.time() - 2
             try:
                 rq_dir = self._get_rq_item_output_dir(stub, rq_item_id)
                 if rq_dir and os.path.isdir(rq_dir) and rq_dir != base_dir:
                     self.log.debug(
                         "No files in %s, trying RQ output dir: %s",
-                        base_dir, rq_dir,
+                        base_dir,
+                        rq_dir,
                     )
+                    subdir_to_files = {}
                     for root, _dirs, files in os.walk(rq_dir):
                         for fname in files:
                             _, ext = os.path.splitext(fname)
@@ -170,37 +167,45 @@ class ExtractMultiCompLocalRender(publish.Extractor):
                                     subdir_to_files.setdefault(root, []).append(fname)
                             except OSError:
                                 pass
-                    for idx, (output_dir, files) in enumerate(sorted(subdir_to_files.items())):
+
+                    comp_names = [m.get("comp_name", "") for m in comp_members]
+                    for fallback_idx, (output_dir, files) in enumerate(
+                        sorted(subdir_to_files.items())
+                    ):
                         if not files:
                             continue
                         subdir_name = os.path.basename(output_dir.rstrip(os.sep))
-                        comp_name = comp_names[idx] if idx < len(comp_names) else ""
-                        base_name = subdir_name if subdir_name and subdir_name not in ("0", "1", "2", "3") else comp_name or subdir_name or "comp_{}".format(idx + 1)
-                        repre_name = _sanitize_comp_name(base_name)
-                        if repre_name in used_repre_names:
-                            repre_name = "{}_{}".format(repre_name, idx + 1)
-                        used_repre_names.add(repre_name)
-                        by_ext = {}
-                        for fname in sorted(files):
-                            ext = os.path.splitext(fname)[1][1:].lower()
-                            by_ext.setdefault(ext, []).append(fname)
-                        for ext, ext_files in by_ext.items():
-                            resulting_files = ext_files[0] if len(ext_files) == 1 else ext_files
-                            ext_repre = repre_name if len(by_ext) == 1 else "{}_{}".format(repre_name, ext)
-                            if ext_repre in used_repre_names:
-                                ext_repre = "{}_{}".format(ext_repre, idx)
-                            used_repre_names.add(ext_repre)
-                            comp_id = members[idx] if idx < len(members) else None
-                            settings = comp_settings.get(comp_id, {}) if comp_id else {}
-                            repre_data = {"name": ext_repre, "ext": ext, "files": resulting_files, "stagingDir": output_dir, "outputName": ext_repre}
-                            if isinstance(resulting_files, list):
-                                repre_data["frameStart"] = settings.get("frame_start")
-                                repre_data["frameEnd"] = settings.get("frame_end")
-                            if mark_review == "first" and not representations:
-                                repre_data["tags"] = ["review"]
-                            elif mark_review == "all":
-                                repre_data["tags"] = ["review"]
-                            representations.append(repre_data)
+                        comp_name = (
+                            comp_names[fallback_idx]
+                            if fallback_idx < len(comp_names)
+                            else ""
+                        )
+                        if subdir_name and subdir_name not in ("0", "1", "2", "3"):
+                            base_name = subdir_name
+                        else:
+                            base_name = (
+                                comp_name
+                                or subdir_name
+                                or "comp_{}".format(fallback_idx + 1)
+                            )
+                        comp_id = (
+                            members[fallback_idx]
+                            if fallback_idx < len(members)
+                            else None
+                        )
+                        representations.extend(
+                            self._build_representations_for_files(
+                                files=files,
+                                output_dir=output_dir,
+                                base_name=base_name,
+                                comp_id=comp_id,
+                                comp_settings=comp_settings,
+                                mark_review=mark_review,
+                                used_repre_names=used_repre_names,
+                                idx=fallback_idx,
+                                has_existing_representations=bool(representations),
+                            )
+                        )
             except Exception as exc:
                 self.log.debug("Fallback RQ dir check failed: %s", exc)
 
@@ -212,6 +217,76 @@ class ExtractMultiCompLocalRender(publish.Extractor):
             "Collected %d representation(s) from multi-comp render",
             len(representations),
         )
+
+    def _collect_new_render_files(self, output_dir, render_start):
+        """Collect image/video files created or updated during a render."""
+        if not os.path.isdir(output_dir):
+            return []
+
+        files = []
+        for fname in os.listdir(output_dir):
+            _, ext = os.path.splitext(fname)
+            if ext.lower() not in IMAGE_EXTS:
+                continue
+            fpath = os.path.join(output_dir, fname)
+            try:
+                if os.path.getmtime(fpath) < render_start - 2:
+                    continue
+            except OSError:
+                continue
+            files.append(fname)
+        return sorted(files)
+
+    def _build_representations_for_files(
+        self,
+        files,
+        output_dir,
+        base_name,
+        comp_id,
+        comp_settings,
+        mark_review,
+        used_repre_names,
+        idx,
+        has_existing_representations,
+    ):
+        """Build representation dicts from rendered files in one output dir."""
+        representations = []
+        repre_name = _sanitize_comp_name(base_name)
+        if repre_name in used_repre_names:
+            repre_name = "{}_{}".format(repre_name, idx + 1)
+        used_repre_names.add(repre_name)
+
+        by_ext = {}
+        for fname in sorted(files):
+            ext = os.path.splitext(fname)[1][1:].lower()
+            by_ext.setdefault(ext, []).append(fname)
+
+        for ext, ext_files in by_ext.items():
+            resulting_files = ext_files[0] if len(ext_files) == 1 else ext_files
+            ext_repre = (
+                repre_name if len(by_ext) == 1 else "{}_{}".format(repre_name, ext)
+            )
+            if ext_repre in used_repre_names:
+                ext_repre = "{}_{}".format(ext_repre, idx)
+            used_repre_names.add(ext_repre)
+
+            repre_data = {
+                "name": ext_repre,
+                "ext": ext,
+                "files": resulting_files,
+                "stagingDir": output_dir,
+                "outputName": ext_repre,
+            }
+
+            if mark_review == "first" and not has_existing_representations:
+                repre_data["tags"] = ["review"]
+                has_existing_representations = True
+            elif mark_review == "all":
+                repre_data["tags"] = ["review"]
+
+            representations.append(repre_data)
+
+        return representations
 
     def _get_rq_item_output_dir(self, stub, rq_item_id):
         """Get output directory from RQ item's filePath attribute."""
@@ -226,36 +301,3 @@ class ExtractMultiCompLocalRender(publish.Extractor):
         except Exception:
             pass
         return None
-
-    def _find_new_files(self, pre_render_files, render_start):
-        """Find files that appeared or were modified after render started."""
-        for directory, old_files in pre_render_files.items():
-            if not os.path.isdir(directory):
-                continue
-
-            current_files = set(os.listdir(directory))
-            brand_new = current_files - old_files
-
-            new_renders = []
-            for fname in brand_new:
-                _, ext = os.path.splitext(fname)
-                if ext.lower() in IMAGE_EXTS:
-                    new_renders.append(fname)
-
-            if not new_renders:
-                for fname in current_files:
-                    _, ext = os.path.splitext(fname)
-                    if ext.lower() not in IMAGE_EXTS:
-                        continue
-                    fpath = os.path.join(directory, fname)
-                    try:
-                        mtime = os.path.getmtime(fpath)
-                        if mtime >= render_start - 2:
-                            new_renders.append(fname)
-                    except OSError:
-                        pass
-
-            if new_renders:
-                return directory, sorted(new_renders)
-
-        return None, []
