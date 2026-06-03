@@ -736,6 +736,39 @@ function executeCommand(cmd) {
                 break;
             }
 
+            case "prepare_multi_comp_manifest": {
+                // Attach (or clear) a Post-Render Script on the RQ item that
+                // records each render's exact composition + resolved path to a
+                // manifest file. Cavalry runs postRenderExpression after every
+                // render performed by the item (once per target).
+                var rqManifestId = cmd.args.item_id;
+                var manifestPath = (cmd.args.manifest_path || "").replace(/\\/g, "/");
+                var expr = "";
+                if (manifestPath) {
+                    expr =
+                        "try{" +
+                        "var __mp=" + JSON.stringify(manifestPath) + ";" +
+                        "var __e=JSON.stringify(" +
+                        "{comp:render.composition,path:render.path});" +
+                        "var __o=\"\";try{__o=api.readFromFile(__mp);}" +
+                        "catch(e){__o=\"\";}" +
+                        "api.writeToFile(__mp,__o+__e+\"\\n\",true);" +
+                        "}catch(err){}";
+                }
+                var setOk = false;
+                try {
+                    api.set(rqManifestId, {postRenderExpression: expr});
+                    setOk = true;
+                } catch (e) {
+                    console.warn(
+                        "AYON: could not set postRenderExpression on " +
+                        rqManifestId + ": " + e
+                    );
+                }
+                result = {success: setOk};
+                break;
+            }
+
             case "render": {
                 var renderItemId = cmd.args.item_id;
                 api.render(renderItemId);

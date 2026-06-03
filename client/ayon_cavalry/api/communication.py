@@ -192,6 +192,42 @@ class CavalryServerTool:
                 " Cavalry via Window > Scripts > AYON."
             )
 
+        cmd_id, event, t0, t_post = self._dispatch_command(command, args)
+
+        if not event.wait(timeout=timeout):
+            with self._lock:
+                self._result_events.pop(cmd_id, None)
+                self._pending_results.pop(cmd_id, None)
+            _log_timing(
+                "send_command %s: POST %.0fms, wait TIMEOUT",
+                command, (t_post - t0) * 1000
+            )
+            raise TimeoutError(
+                "Command '{}' timed out after {}s".format(command, timeout)
+            )
+
+        t_wait = time.perf_counter()
+        result = self.get_command_result(cmd_id)
+
+        t_total = (time.perf_counter() - t0) * 1000
+        _log_timing(
+            "send_command %s: POST %.0fms, wait %.0fms, total %.0fms",
+            command,
+            (t_post - t0) * 1000,
+            (t_wait - t_post) * 1000,
+            t_total,
+        )
+        return result
+
+    def _dispatch_command(self, command, args=None):
+        """POST a command to Cavalry and register its result event.
+
+        Does not wait for the result. Returns the bookkeeping needed to wait
+        later. Raises ConnectionError if the POST fails.
+
+        Returns:
+            tuple: ``(cmd_id, event, t0, t_post)``.
+        """
         cmd_id = str(uuid.uuid4())
         event = threading.Event()
 
@@ -221,31 +257,36 @@ class CavalryServerTool:
                 "Failed to send command to Cavalry: {}".format(exc)
             )
         t_post = time.perf_counter()
+        return cmd_id, event, t0, t_post
 
-        if not event.wait(timeout=timeout):
-            with self._lock:
-                self._result_events.pop(cmd_id, None)
-            _log_timing(
-                "send_command %s: POST %.0fms, wait TIMEOUT",
-                command, (t_post - t0) * 1000
-            )
-            raise TimeoutError(
-                "Command '{}' timed out after {}s".format(command, timeout)
-            )
+    def send_command_async(self, command, args=None):
+        """Send a command without blocking for the result.
 
-        t_wait = time.perf_counter()
+        Use together with the returned event to wait in a custom poll loop
+        (e.g. to refresh the publisher UI while a long render runs), then call
+        :meth:`get_command_result` once the event is set.
+
+        Args:
+            command (str): Command name.
+            args (dict): Command arguments.
+
+        Returns:
+            tuple: ``(cmd_id, event)`` where ``event`` is set when the result
+                arrives.
+        """
+        if not self._connected or self._cavalry_port is None:
+            raise ConnectionError(
+                "Cavalry panel is not connected. Open the AYON panel in"
+                " Cavalry via Window > Scripts > AYON."
+            )
+        cmd_id, event, _t0, _t_post = self._dispatch_command(command, args)
+        return cmd_id, event
+
+    def get_command_result(self, cmd_id):
+        """Pop the stored result for a previously dispatched command."""
         with self._lock:
             result = self._pending_results.pop(cmd_id, {})
             self._result_events.pop(cmd_id, None)
-
-        t_total = (time.perf_counter() - t0) * 1000
-        _log_timing(
-            "send_command %s: POST %.0fms, wait %.0fms, total %.0fms",
-            command,
-            (t_post - t0) * 1000,
-            (t_wait - t_post) * 1000,
-            t_total,
-        )
         return result
 
     def send_commands_batch(self, commands, timeout=60):
@@ -693,6 +734,28 @@ class CavalryServerTool:
         result = self.send_command("create_rq_item_multi_comp_and_imprint", args)
         return result.get("item_id", "")
 
+    def prepare_multi_comp_manifest(self, item_id, manifest_path):
+        """Attach (or clear) a Post-Render Script that records render outputs.
+
+        The script runs after every render performed by the Render Queue item
+        (once per target/composition) and appends one JSON line per render to
+        ``manifest_path`` containing the composition layer id and the fully
+        resolved output path. Pass an empty ``manifest_path`` to clear it.
+
+        Args:
+            item_id (str): Render Queue Item ID.
+            manifest_path (str): Absolute manifest file path (forward slashes),
+                or empty string to remove the script.
+
+        Returns:
+            bool: True if the script attribute was set.
+        """
+        result = self.send_command("prepare_multi_comp_manifest", {
+            "item_id": str(item_id),
+            "manifest_path": (manifest_path or "").replace("\\", "/"),
+        })
+        return bool(result.get("success"))
+
     def render(self, item_id, timeout=300):
         """Render a specific Render Queue item (blocking).
 
@@ -707,6 +770,15 @@ class CavalryServerTool:
         return self.send_command(
             "render", {"item_id": str(item_id)}, timeout=timeout
         )
+
+    def render_async(self, item_id):
+        """Start a render without blocking; returns ``(cmd_id, event)``.
+
+        Pair with :meth:`get_command_result` once ``event`` is set. Useful to
+        poll render progress (e.g. a manifest) and refresh the publisher UI
+        while the render runs.
+        """
+        return self.send_command_async("render", {"item_id": str(item_id)})
 
     def render_all(self, timeout=600):
         """Render all Render Queue items (blocking).

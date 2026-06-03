@@ -24,6 +24,23 @@ def report_multi_comp_render_progress(comp_index, comp_total):
     return plugin_label
 
 
+def report_multi_comp_status(message):
+    """Push a free-form status suffix to the publisher overlay.
+
+    Used for phases that are not per-comp (e.g. the single batch render),
+    so the window still shows activity instead of appearing frozen.
+
+    Returns:
+        str: Plugin label that was emitted (for ``self.label`` sync).
+    """
+    if message:
+        plugin_label = "{} — {}".format(EXTRACT_MULTI_COMP_LABEL, message)
+    else:
+        plugin_label = EXTRACT_MULTI_COMP_LABEL
+    _emit_publish_status(plugin_label=plugin_label)
+    return plugin_label
+
+
 def _emit_publish_status(plugin_label=None, instance_label=None):
     controller = _get_publisher_controller()
     if controller is None:

@@ -1,23 +1,40 @@
 """Extract local render from Cavalry for multi-comp instances.
 
-Renders each composition sequentially so the publisher can show per-comp
-progress. Collects outputs from comp-specific subdirectories and builds
-one representation per comp/output location.
+Renders the publish instance's existing Render Queue item once (the same
+item created in the UI when you added the render product). Output paths
+come from that RQ item and Cavalry — not invented version folders under work/.
+
+Collects new files under the RQ path / work/.../render and maps them to
+compositions by folder or file name.
 """
 
 import os
 import re
+import json
 import time
+
+MANIFEST_NAME = ".ayon_render_manifest.jsonl"
 
 from ayon_core.pipeline import publish
 
 from ayon_cavalry.api import get_stub
-from ayon_cavalry.api.publish_progress import report_multi_comp_render_progress
+from ayon_cavalry.api.publish_progress import (
+    report_multi_comp_render_progress,
+    report_multi_comp_status,
+)
 
 IMAGE_EXTS = {
     ".png", ".jpg", ".jpeg", ".exr", ".tiff", ".tif",
     ".tga", ".bmp", ".mp4", ".mov", ".avi", ".svg",
 }
+
+
+def _safe_listdir(directory):
+    """List directory entries; skip paths Windows denies."""
+    try:
+        return os.listdir(directory)
+    except OSError:
+        return []
 
 
 def _sanitize_comp_name(name):
@@ -27,7 +44,7 @@ def _sanitize_comp_name(name):
 
 
 class ExtractMultiCompLocalRender(publish.Extractor):
-    """Render multi-comp instance one comp at a time and collect outputs."""
+    """Render multi-comp RQ item once and collect outputs per composition."""
 
     order = publish.Extractor.order - 0.46
     label = "Extract Multi-Comp Local Render"
@@ -45,9 +62,9 @@ class ExtractMultiCompLocalRender(publish.Extractor):
             return
 
         stub = get_stub()
-        members = instance.data.get("members", [])
         comp_settings = instance.data.get("comp_settings", {})
         comp_members = instance.data.get("comp_members", [])
+        members = instance.data.get("members", [])
         if not comp_members and members:
             comp_members = [
                 {"comp_id": comp_id, "comp_name": ""}
@@ -62,26 +79,96 @@ class ExtractMultiCompLocalRender(publish.Extractor):
 
         work_dir = os.path.normpath(os.path.dirname(current_file))
         render_dir = os.path.join(work_dir, "render").replace("\\", "/")
-        product_name = instance.data.get("productName", "renderMain")
-        version = instance.data.get("version") or instance.context.data.get("version", 1)
-        version_str = "v{:03d}".format(version)
-        base_dir = os.path.join(
-            render_dir,
-            "{}_{}".format(product_name, version_str)
-        ).replace("\\", "/")
+        rq_output_dir = self._get_rq_item_output_dir(stub, rq_item_id)
 
-        os.makedirs(base_dir, exist_ok=True)
-        stub.set_render_path(path=base_dir, item_id=rq_item_id)
+        candidate_dirs = self._build_collect_roots(
+            work_dir, render_dir, rq_output_dir
+        )
+        if not candidate_dirs:
+            self.log.error(
+                "No render output directory on RQ item %s. "
+                "Set Path in Render Manager before publishing.",
+                rq_item_id,
+            )
+            instance.data["representations"] = []
+            return
+
+        self.log.info(
+            "Multi-comp render using RQ item %s. Collecting under: %s",
+            rq_item_id,
+            ", ".join(candidate_dirs),
+        )
+
+        pre_render_files = {}
+        for directory in candidate_dirs:
+            if os.path.isdir(directory):
+                pre_render_files[directory] = set(_safe_listdir(directory))
 
         creator_attributes = instance.data.get("creator_attributes", {})
         mark_review = creator_attributes.get("mark_for_review_mode", "first")
         total_comps = len(comp_members)
 
+        # Deterministic mapping: ask Cavalry to record each render's exact
+        # composition + resolved path via a Post-Render Script manifest.
+        manifest_dir = rq_output_dir or render_dir
+        manifest_path = os.path.join(manifest_dir, MANIFEST_NAME)
+        self._remove_manifest(manifest_path)
+        manifest_enabled = False
+        try:
+            manifest_enabled = stub.prepare_multi_comp_manifest(
+                rq_item_id, manifest_path.replace("\\", "/")
+            )
+        except Exception as exc:
+            self.log.warning("Could not attach render manifest script: %s", exc)
+
+        self.label = report_multi_comp_status(
+            "rendering {} comp(s)…".format(total_comps)
+        )
+
+        render_start = time.time()
+        render_result = self._render_with_progress(
+            stub, rq_item_id, manifest_path, manifest_enabled, total_comps
+        )
+        self.log.info(
+            "Render completed for multi-comp RQ item %s (%d targets)",
+            rq_item_id,
+            total_comps,
+        )
+
+        # Clear the script so it is not baked into the saved workfile.
+        if manifest_enabled:
+            try:
+                stub.prepare_multi_comp_manifest(rq_item_id, "")
+            except Exception:
+                pass
+
+        manifest_map = self._read_manifest(manifest_path)
+        if manifest_map:
+            self.log.info(
+                "Render manifest mapped %d composition(s) to exact files",
+                len(manifest_map),
+            )
+
+        if render_result:
+            for directory in self._dirs_from_render_result(render_result):
+                if directory and os.path.isdir(directory):
+                    if directory not in pre_render_files:
+                        pre_render_files[directory] = set(_safe_listdir(directory))
+
+        comp_outputs = self._group_new_files_by_comp(
+            comp_members,
+            comp_settings,
+            candidate_dirs,
+            pre_render_files,
+            render_start,
+        )
+
         representations = []
         used_repre_names = set()
-
         for idx, comp_member in enumerate(comp_members):
-            comp_index = idx + 1
+            self.label = report_multi_comp_render_progress(
+                idx + 1, total_comps
+            )
             comp_id = comp_member.get("comp_id") or (
                 members[idx] if idx < len(members) else None
             )
@@ -89,153 +176,328 @@ class ExtractMultiCompLocalRender(publish.Extractor):
             if not comp_name and comp_id:
                 comp_name = comp_settings.get(comp_id, {}).get("name", "")
 
-            self.label = report_multi_comp_render_progress(
-                comp_index, total_comps
+            subdir_name = _sanitize_comp_name(comp_name) or "comp_{}".format(
+                idx + 1
             )
 
-            subdir_name = _sanitize_comp_name(comp_name) or "comp_{}".format(comp_index)
-            comp_output_dir = os.path.join(base_dir, subdir_name).replace("\\", "/")
-            os.makedirs(comp_output_dir, exist_ok=True)
-
-            if not comp_id:
-                self.log.warning(
-                    "Skipping comp %d/%d: missing comp id",
-                    comp_index,
-                    total_comps,
-                )
-                continue
-
-            temp_rq_id = stub.add_render_queue_item(comp_id)
-            stub.set_render_path(path=comp_output_dir, item_id=temp_rq_id)
-
-            render_start = time.time()
-            stub.render(temp_rq_id, timeout=600)
-            self.log.info(
-                "Render completed for comp %s (%d/%d)",
-                comp_name or comp_id,
-                comp_index,
-                total_comps,
+            # Prefer the exact files Cavalry reported for this composition;
+            # fall back to the folder/name heuristic only if the manifest
+            # has no usable entry for it.
+            output_dir, files = self._files_from_manifest(
+                manifest_map, comp_id, comp_name
             )
-
-            files = self._collect_new_render_files(comp_output_dir, render_start)
+            if not files:
+                output_dir, files = comp_outputs.get(subdir_name, (None, []))
             if not files:
                 self.log.warning(
-                    "No render output for comp %s in %s",
+                    "No render output matched comp %s under %s",
                     comp_name or comp_id,
-                    comp_output_dir,
+                    candidate_dirs,
                 )
                 continue
 
-            comp_representations = self._build_representations_for_files(
-                files=files,
-                output_dir=comp_output_dir,
-                base_name=subdir_name,
-                comp_id=comp_id,
-                comp_settings=comp_settings,
-                mark_review=mark_review,
-                used_repre_names=used_repre_names,
-                idx=idx,
-                has_existing_representations=bool(representations),
+            representations.extend(
+                self._build_representations_for_files(
+                    files=files,
+                    output_dir=output_dir,
+                    base_name=subdir_name,
+                    comp_id=comp_id,
+                    comp_settings=comp_settings,
+                    mark_review=mark_review,
+                    used_repre_names=used_repre_names,
+                    idx=idx,
+                    has_existing_representations=bool(representations),
+                )
             )
-            representations.extend(comp_representations)
-
-        if not representations:
-            self.log.warning(
-                "No render output in %s (version=%s). "
-                "Check that Cavalry wrote to the expected path.",
-                base_dir,
-                version_str,
-            )
-            render_start = time.time() - 2
-            try:
-                rq_dir = self._get_rq_item_output_dir(stub, rq_item_id)
-                if rq_dir and os.path.isdir(rq_dir) and rq_dir != base_dir:
-                    self.log.debug(
-                        "No files in %s, trying RQ output dir: %s",
-                        base_dir,
-                        rq_dir,
-                    )
-                    subdir_to_files = {}
-                    for root, _dirs, files in os.walk(rq_dir):
-                        for fname in files:
-                            _, ext = os.path.splitext(fname)
-                            if ext.lower() not in IMAGE_EXTS:
-                                continue
-                            try:
-                                fpath = os.path.join(root, fname)
-                                if os.path.getmtime(fpath) >= render_start - 2:
-                                    subdir_to_files.setdefault(root, []).append(fname)
-                            except OSError:
-                                pass
-
-                    comp_names = [m.get("comp_name", "") for m in comp_members]
-                    for fallback_idx, (output_dir, files) in enumerate(
-                        sorted(subdir_to_files.items())
-                    ):
-                        if not files:
-                            continue
-                        subdir_name = os.path.basename(output_dir.rstrip(os.sep))
-                        comp_name = (
-                            comp_names[fallback_idx]
-                            if fallback_idx < len(comp_names)
-                            else ""
-                        )
-                        if subdir_name and subdir_name not in ("0", "1", "2", "3"):
-                            base_name = subdir_name
-                        else:
-                            base_name = (
-                                comp_name
-                                or subdir_name
-                                or "comp_{}".format(fallback_idx + 1)
-                            )
-                        comp_id = (
-                            members[fallback_idx]
-                            if fallback_idx < len(members)
-                            else None
-                        )
-                        representations.extend(
-                            self._build_representations_for_files(
-                                files=files,
-                                output_dir=output_dir,
-                                base_name=base_name,
-                                comp_id=comp_id,
-                                comp_settings=comp_settings,
-                                mark_review=mark_review,
-                                used_repre_names=used_repre_names,
-                                idx=fallback_idx,
-                                has_existing_representations=bool(representations),
-                            )
-                        )
-            except Exception as exc:
-                self.log.debug("Fallback RQ dir check failed: %s", exc)
 
         instance.data["representations"] = representations
         if representations:
-            instance.data["stagingDir"] = base_dir
+            staging = rq_output_dir or render_dir
+            instance.data["stagingDir"] = staging
 
         self.log.info(
             "Collected %d representation(s) from multi-comp render",
             len(representations),
         )
 
-    def _collect_new_render_files(self, output_dir, render_start):
-        """Collect image/video files created or updated during a render."""
-        if not os.path.isdir(output_dir):
+    def _build_collect_roots(self, work_dir, render_dir, rq_output_dir):
+        """Directories to scan for output: the RQ item's path and work/.../render."""
+        dirs = []
+        for directory in (rq_output_dir, render_dir):
+            if not directory:
+                continue
+            normalized = os.path.normpath(directory)
+            if normalized not in dirs:
+                dirs.append(normalized)
+        return dirs
+
+    def _group_new_files_by_comp(
+        self,
+        comp_members,
+        comp_settings,
+        candidate_dirs,
+        pre_render_files,
+        render_start,
+    ):
+        """Map new render files to comps by sanitized name in path."""
+        comp_keys = []
+        for idx, comp_member in enumerate(comp_members):
+            comp_name = comp_member.get("comp_name", "")
+            comp_id = comp_member.get("comp_id")
+            if not comp_name and comp_id:
+                comp_name = comp_settings.get(comp_id, {}).get("name", "")
+            key = _sanitize_comp_name(comp_name) or "comp_{}".format(idx + 1)
+            comp_keys.append((key, comp_name))
+
+        grouped = {key: [] for key, _ in comp_keys}
+
+        for directory in candidate_dirs:
+            for root, _dirnames, filenames in self._safe_walk(directory):
+                for fname in filenames:
+                    _, ext = os.path.splitext(fname)
+                    if ext.lower() not in IMAGE_EXTS:
+                        continue
+                    fpath = os.path.join(root, fname)
+                    if not self._is_new_render_file(
+                        fpath, directory, pre_render_files, render_start
+                    ):
+                        continue
+
+                    rel = os.path.relpath(root, directory)
+                    folder_hay = (
+                        "" if rel in (".", "") else rel.replace("\\", "/").lower()
+                    )
+                    fname_hay = fname.lower()
+
+                    matched_key = self._match_comp_key(
+                        comp_keys, folder_hay, fname_hay
+                    )
+                    if matched_key:
+                        grouped[matched_key].append((root, fname))
+
+        result = {}
+        for key, _ in comp_keys:
+            entries = grouped.get(key) or []
+            if not entries:
+                result[key] = (None, [])
+                continue
+            by_dir = {}
+            for root, fname in entries:
+                by_dir.setdefault(root, []).append(fname)
+            best_root = max(by_dir.keys(), key=lambda r: len(by_dir[r]))
+            result[key] = (best_root, sorted(by_dir[best_root]))
+        return result
+
+    def _render_with_progress(
+        self, stub, rq_item_id, manifest_path, manifest_enabled, total_comps
+    ):
+        """Render the multi-comp item, refreshing (N/Total) while it runs.
+
+        The render is a single blocking call on Cavalry's side, so we dispatch
+        it without blocking and poll the manifest (one line appended per comp
+        by the Post-Render Script) to advance the publisher overlay. Falls back
+        to a plain blocking render if the async path is unavailable.
+        """
+        render_timeout = 3600
+        poll_interval = 0.5
+
+        if not manifest_enabled or not hasattr(stub, "render_async"):
+            return stub.render(rq_item_id, timeout=render_timeout)
+
+        try:
+            cmd_id, event = stub.render_async(rq_item_id)
+        except Exception as exc:
+            self.log.warning(
+                "Async render unavailable (%s); falling back to blocking.", exc
+            )
+            return stub.render(rq_item_id, timeout=render_timeout)
+
+        deadline = time.time() + render_timeout
+        last_reported = -1
+        while not event.wait(poll_interval):
+            done = self._count_manifest_entries(manifest_path)
+            if 0 < done != last_reported:
+                self.label = report_multi_comp_render_progress(
+                    min(done, total_comps), total_comps
+                )
+                last_reported = done
+            if time.time() > deadline:
+                self.log.warning(
+                    "Render exceeded %ss; stopping progress poll.",
+                    render_timeout,
+                )
+                break
+
+        # Render finished: flush the counter to the full total.
+        self.label = report_multi_comp_render_progress(total_comps, total_comps)
+        return stub.get_command_result(cmd_id)
+
+    def _count_manifest_entries(self, manifest_path):
+        """Count completed renders recorded in the manifest so far."""
+        if not manifest_path or not os.path.isfile(manifest_path):
+            return 0
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as handle:
+                return sum(1 for line in handle if line.strip())
+        except OSError:
+            return 0
+
+    def _remove_manifest(self, manifest_path):
+        """Delete a stale manifest from a previous publish (best-effort)."""
+        try:
+            if manifest_path and os.path.isfile(manifest_path):
+                os.remove(manifest_path)
+        except OSError:
+            pass
+
+    def _read_manifest(self, manifest_path):
+        """Parse the Post-Render manifest into ``{comp_id: [abs_path, ...]}``.
+
+        Each line is one JSON object emitted by the post-render script with
+        ``comp`` (a composition layer id, or list of ids) and ``path`` (the
+        resolved output file). Returns an empty dict when no manifest exists.
+        """
+        result = {}
+        if not manifest_path or not os.path.isfile(manifest_path):
+            return result
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as handle:
+                lines = handle.readlines()
+        except OSError:
+            return result
+
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue
+            path = entry.get("path")
+            if not path:
+                continue
+            comp = entry.get("comp")
+            comps = comp if isinstance(comp, list) else [comp]
+            norm_path = os.path.normpath(path)
+            for comp_id in comps:
+                if comp_id:
+                    result.setdefault(str(comp_id), []).append(norm_path)
+        return result
+
+    def _files_from_manifest(self, manifest_map, comp_id, comp_name):
+        """Return ``(output_dir, [filenames])`` recorded for a composition.
+
+        Matches on the composition layer id first, then on the comp name as a
+        fallback. Only files that actually exist on disk are returned, so a
+        stale manifest entry cleanly degrades to the heuristic path.
+        """
+        if not manifest_map:
+            return None, []
+
+        paths = []
+        if comp_id and str(comp_id) in manifest_map:
+            paths = manifest_map[str(comp_id)]
+        elif comp_name and comp_name in manifest_map:
+            paths = manifest_map[comp_name]
+
+        existing = [p for p in paths if os.path.isfile(p)]
+        if not existing:
+            return None, []
+
+        output_dir = os.path.dirname(existing[0])
+        files = sorted({os.path.basename(p) for p in existing})
+        return output_dir, files
+
+    def _match_comp_key(self, comp_keys, folder_hay, fname_hay):
+        """Map a rendered file to a comp.
+
+        Cavalry writes a correct per-comp *subfolder* but may reuse the same
+        *file name* for every target, so the folder is the reliable signal.
+        Match the folder first; only fall back to the file name when no comp
+        subfolder is present (flat output).
+        """
+        if folder_hay:
+            for key, comp_name in comp_keys:
+                if key.lower() in folder_hay:
+                    return key
+                if comp_name and comp_name.lower() in folder_hay:
+                    return key
+
+        for key, comp_name in comp_keys:
+            if key.lower() in fname_hay:
+                return key
+            if comp_name and comp_name.lower() in fname_hay:
+                return key
+
+        if len(comp_keys) == 1:
+            return comp_keys[0][0]
+        return None
+
+    def _safe_walk(self, directory):
+        """os.walk that skips unreadable directories."""
+        try:
+            for item in os.walk(directory):
+                yield item
+        except OSError:
+            return
+
+    def _is_new_render_file(
+        self, fpath, snapshot_root, pre_render_files, render_start
+    ):
+        """True if file is new since render started."""
+        fname = os.path.basename(fpath)
+        try:
+            mtime = os.path.getmtime(fpath)
+        except OSError:
+            return False
+
+        if mtime < render_start - 2:
+            return False
+
+        old = pre_render_files.get(snapshot_root, set())
+        if fname in old:
+            try:
+                if mtime >= render_start - 2:
+                    return True
+            except OSError:
+                pass
+            return False
+        return True
+
+    def _dirs_from_render_result(self, render_result):
+        """Extract directory candidates from a Cavalry render command result."""
+        if not isinstance(render_result, dict):
             return []
 
-        files = []
-        for fname in os.listdir(output_dir):
-            _, ext = os.path.splitext(fname)
-            if ext.lower() not in IMAGE_EXTS:
-                continue
-            fpath = os.path.join(output_dir, fname)
-            try:
-                if os.path.getmtime(fpath) < render_start - 2:
-                    continue
-            except OSError:
-                continue
-            files.append(fname)
-        return sorted(files)
+        dirs = []
+        item_attrs = render_result.get("item_attrs", {})
+
+        file_path = item_attrs.get("filePath")
+        if file_path and isinstance(file_path, str):
+            parent = os.path.dirname(file_path) or file_path
+            dirs.append(os.path.normpath(parent))
+        elif isinstance(file_path, dict) and file_path.get("value"):
+            value = str(file_path["value"])
+            dirs.append(os.path.normpath(os.path.dirname(value) or value))
+
+        render_path = render_result.get("render_path", "")
+        if render_path:
+            dirs.append(os.path.normpath(render_path))
+
+        scene_path = render_result.get("scene_path", "")
+        if scene_path:
+            scene_dir = os.path.normpath(os.path.dirname(scene_path))
+            if scene_dir:
+                dirs.append(scene_dir)
+
+        seen = set()
+        unique = []
+        for directory in dirs:
+            if directory and directory not in seen:
+                seen.add(directory)
+                unique.append(directory)
+        return unique
 
     def _build_representations_for_files(
         self,
@@ -289,15 +551,25 @@ class ExtractMultiCompLocalRender(publish.Extractor):
         return representations
 
     def _get_rq_item_output_dir(self, stub, rq_item_id):
-        """Get output directory from RQ item's filePath attribute."""
+        """Directory from the RQ item Path / filePath (as configured in Cavalry)."""
         try:
             info = stub.get_render_queue_item_info(rq_item_id)
             attrs = info.get("attributes", {})
             file_path = attrs.get("filePath")
             if file_path and isinstance(file_path, str):
-                return os.path.normpath(file_path)
+                return self._path_to_search_dir(file_path)
             if isinstance(file_path, dict) and "value" in file_path:
-                return os.path.normpath(file_path["value"])
+                return self._path_to_search_dir(file_path["value"])
         except Exception:
             pass
         return None
+
+    def _path_to_search_dir(self, path):
+        """Return a directory to search for rendered files."""
+        if not path:
+            return None
+        normalized = os.path.normpath(path)
+        if os.path.isdir(normalized):
+            return normalized
+        parent = os.path.dirname(normalized)
+        return parent or normalized
