@@ -18,6 +18,7 @@ MANIFEST_NAME = ".ayon_render_manifest.jsonl"
 from ayon_core.pipeline import publish
 
 from ayon_cavalry.api import get_stub
+from ayon_cavalry.api.publish_thumbnail import tag_need_thumbnail
 from ayon_cavalry.api.publish_progress import (
     report_multi_comp_render_progress,
     report_multi_comp_status,
@@ -210,6 +211,12 @@ class ExtractMultiCompLocalRender(publish.Extractor):
                 )
             )
 
+        thumb_repre = tag_need_thumbnail(representations)
+        if thumb_repre:
+            self.log.info(
+                "Tagged representation %r with need_thumbnail for version thumbnail",
+                thumb_repre,
+            )
         instance.data["representations"] = representations
         if representations:
             staging = rq_output_dir or render_dir

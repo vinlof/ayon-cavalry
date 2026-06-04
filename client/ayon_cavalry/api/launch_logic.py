@@ -23,9 +23,25 @@ from ayon_core.tools.utils import host_tools, get_ayon_qt_app
 
 from .communication import CavalryServerTool
 from .lib import apply_settings_to_selected_comps
+from .panel_tool_handlers import (
+    is_registered_panel_tool,
+    load_panel_tool_handlers_from_manifest,
+)
 
 log = logging.getLogger(__name__)
 log.setLevel(logging.DEBUG)
+
+from .panel_tool_registry import (
+    get_cavalry_tool_handler,
+    register_cavalry_tool_handler,
+    unregister_cavalry_tool_handler,
+)
+
+# Re-export for other addons.
+__all__ = (
+    "register_cavalry_tool_handler",
+    "unregister_cavalry_tool_handler",
+)
 
 
 def safe_excepthook(*args):
@@ -416,6 +432,12 @@ class CavalryProcessLauncher(QtCore.QObject):
             "Cavalry", "Scripts", "AYON"
         )
         self._server.write_config_file(scripts_dir)
+        loaded = load_panel_tool_handlers_from_manifest(scripts_dir)
+        if loaded:
+            self.log.info(
+                "Loaded %d Cavalry panel tool handler(s) from manifest",
+                loaded,
+            )
         self._server.start()
 
     def _on_tool_requested(self, tool_name, data=None):
@@ -431,10 +453,25 @@ class CavalryProcessLauncher(QtCore.QObject):
                     _run_apply_settings, frames, resolution
                 )
             )
-        else:
+            return
+
+        handler = get_cavalry_tool_handler(tool_name)
+        if handler is not None:
+            self.log.info("Queueing custom panel tool: %s", tool_name)
             self.execute_in_main_thread(
-                functools.partial(show_tool_by_name, tool_name, data)
+                functools.partial(handler, data)
             )
+            return
+
+        if not is_registered_panel_tool(tool_name):
+            self.log.warning(
+                "No Cavalry panel tool handler registered for: %s",
+                tool_name,
+            )
+
+        self.execute_in_main_thread(
+            functools.partial(show_tool_by_name, tool_name, data)
+        )
 
     def _start_process(self):
         if self._process is not None:

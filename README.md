@@ -175,6 +175,15 @@ Scripts appear in Cavalry under `Window > Scripts > [Subfolder Name]`.
 - **Validate Scene Settings** — Enable validation that checks composition settings against AYON folder/task attributes before publishing.
 - **Increment Workfile on Publish** — Automatically increment the workfile version after a successful publish.
 
+## AYON panel extensions (other addons)
+
+Other addons can extend the dockable AYON panel without modifying this addon:
+
+1. **Extra buttons** — On Cavalry launch, write `Scripts/AYON/ayon_panel_extensions.json` listing JS files and their register function names. The panel loads each script and calls `registerFn(layout, requestPanelTool)` to add UI.
+2. **Custom `/tool` handlers** — Write `Scripts/AYON/ayon_panel_tool_handlers.json` with `module` + `callable` entries. The Cavalry **host subprocess** imports and registers them on startup (pre-launch hooks run in the launcher process only).
+
+See `ayon_cavalry/api/js/ayon_panel.js` (`installOptionalPanelExtensions`) and `ayon_cavalry/api/launch_logic.py` (`register_cavalry_tool_handler`).
+
 ## Environment Variables
 
 | Variable | Default | Purpose |

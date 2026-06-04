@@ -18,6 +18,8 @@ var TIMING_ENABLED = false;
 
 // Try to read connection config written by the Python launcher.
 // The config file sits next to this script.
+var _loggedConfigPort = null;
+
 function loadConfig() {
     try {
         var configPath = ui.scriptLocation + "/ayon_config.json";
@@ -30,7 +32,10 @@ function loadConfig() {
             if (cfg.timing === false) {
                 TIMING_ENABLED = false;
             }
-            console.log("AYON: Loaded config - Python port: " + PYTHON_PORT);
+            if (_loggedConfigPort !== PYTHON_PORT) {
+                _loggedConfigPort = PYTHON_PORT;
+                console.log("AYON: Loaded config - Python port: " + PYTHON_PORT);
+            }
         } else {
             console.warn(
                 "AYON: No config file found at " + configPath
@@ -1304,34 +1309,88 @@ manageBtn.onClick = function () { openTool("sceneinventory"); };
 manageBtn.setFixedHeight(40);
 toolsLayout.add(manageBtn);
 
-function requestSetSettings(frames, resolution) {
+function requestPanelTool(toolName, data) {
     try {
         var client = refreshPythonClient();
-        var payload = {
-            tool: "set_settings",
-            frames: !!frames,
-            resolution: !!resolution
-        };
+        var payload = { tool: toolName };
+        if (data) {
+            for (var key in data) {
+                if (Object.prototype.hasOwnProperty.call(data, key)) {
+                    payload[key] = data[key];
+                }
+            }
+        }
         client.post("/tool", JSON.stringify(payload), "application/json");
         var status = client.status();
         if (status !== 200) {
-            console.error("AYON: Set settings failed (status " + status + ")");
+            console.error(
+                "AYON: Panel tool " + toolName + " failed (status " + status + ")"
+            );
             refreshPythonClient();
             showErrorModal(
-                "AYON - Set Settings Failed",
+                "AYON - Tool Failed",
                 "Could not reach Python server (status " + status + "). " +
                 "Ensure Cavalry was launched from AYON."
             );
         }
     } catch (e) {
-        console.error("AYON: Set settings error: " + e);
+        console.error("AYON: Panel tool " + toolName + " error: " + e);
         refreshPythonClient();
         showErrorModal(
-            "AYON - Set Settings Error",
+            "AYON - Tool Error",
             "Error: " + String(e) + ". Ensure Cavalry was launched from AYON."
         );
     }
 }
+
+function installOptionalPanelExtensions(layout) {
+    // Studio addons install Scripts/AYON/ayon_panel_extensions.json listing
+    // { "extensions": [ { "script": "extensions/foo.js", "register": "fnName" } ] }
+    var manifestPath = ui.scriptLocation + "/ayon_panel_extensions.json";
+    if (!api.filePathExists(manifestPath)) {
+        return;
+    }
+    try {
+        var manifest = JSON.parse(api.readFromFile(manifestPath));
+        var entries = manifest.extensions || [];
+        for (var i = 0; i < entries.length; i++) {
+            var entry = entries[i];
+            if (!entry || !entry.script || !entry.register) {
+                continue;
+            }
+            var scriptPath = ui.scriptLocation + "/" + entry.script;
+            if (!api.filePathExists(scriptPath)) {
+                console.warn(
+                    "AYON: Panel extension script missing: " + scriptPath
+                );
+                continue;
+            }
+            var src = api.readFromFile(scriptPath);
+            var registerFn = new Function(
+                src + "\nreturn " + entry.register + ";"
+            )();
+            if (typeof registerFn !== "function") {
+                console.warn(
+                    "AYON: Panel extension register not found: "
+                    + entry.register
+                );
+                continue;
+            }
+            registerFn(layout, requestPanelTool);
+        }
+    } catch (e) {
+        console.warn("AYON: Panel extensions failed: " + e);
+    }
+}
+
+function requestSetSettings(frames, resolution) {
+    requestPanelTool("set_settings", {
+        frames: !!frames,
+        resolution: !!resolution
+    });
+}
+
+installOptionalPanelExtensions(toolsLayout);
 
 var setFramesBtn = new ui.Button("Set Frame Range");
 setFramesBtn.onClick = function () { requestSetSettings(true, false); };

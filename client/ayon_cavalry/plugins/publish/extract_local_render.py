@@ -14,6 +14,7 @@ import time
 from ayon_core.pipeline import publish
 
 from ayon_cavalry.api import get_stub
+from ayon_cavalry.api.publish_thumbnail import tag_need_thumbnail
 
 IMAGE_EXTS = {
     ".png", ".jpg", ".jpeg", ".exr", ".tiff", ".tif",
@@ -100,6 +101,12 @@ class ExtractLocalRender(publish.Extractor):
         representations = self._build_representations(
             output_dir, new_files, instance
         )
+        thumb_repre = tag_need_thumbnail(representations)
+        if thumb_repre:
+            self.log.info(
+                "Tagged representation %r with need_thumbnail for version thumbnail",
+                thumb_repre,
+            )
         instance.data["representations"] = representations
 
         self.log.info(
