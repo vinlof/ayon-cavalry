@@ -44,6 +44,51 @@ def _sanitize_comp_name(name):
     return sanitized or "comp"
 
 
+def incomplete_comp_output_message(comp_file_counts):
+    """Return an error when a multi-comp render is missing or uneven.
+
+    ``comp_file_counts`` is an ordered sequence of ``(label, file_count)``.
+    Compositions on one Render Queue item share render settings, so every
+    composition must have files and every composition must have the same
+    count. A shorter list means that composition was still rendering or
+    never started. Returns ``None`` when the set is complete.
+    """
+    counts = list(comp_file_counts)
+    if not counts:
+        return (
+            "Multi-comp render produced no outputs; "
+            "refusing to publish a partial set."
+        )
+
+    present = [count for _label, count in counts if count > 0]
+    expected = max(present) if present else 0
+    missing = [label for label, count in counts if count <= 0]
+    short = [
+        (label, count)
+        for label, count in counts
+        if 0 < count < expected
+    ]
+    if not missing and not short:
+        return None
+
+    parts = []
+    if missing:
+        parts.append("no output for: {}".format(", ".join(missing)))
+    if short:
+        parts.append(
+            "partial output for: {}".format(
+                ", ".join(
+                    "{} ({}/{})".format(label, count, expected)
+                    for label, count in short
+                )
+            )
+        )
+    return (
+        "Multi-comp render is incomplete ({}); "
+        "refusing to publish a partial set.".format("; ".join(parts))
+    )
+
+
 class ExtractMultiCompLocalRender(publish.Extractor):
     """Render multi-comp RQ item once and collect outputs per composition."""
 
@@ -164,8 +209,7 @@ class ExtractMultiCompLocalRender(publish.Extractor):
             render_start,
         )
 
-        representations = []
-        used_repre_names = set()
+        collected = []
         for idx, comp_member in enumerate(comp_members):
             self.label = report_multi_comp_render_progress(
                 idx + 1, total_comps
@@ -180,6 +224,7 @@ class ExtractMultiCompLocalRender(publish.Extractor):
             subdir_name = _sanitize_comp_name(comp_name) or "comp_{}".format(
                 idx + 1
             )
+            label = comp_name or comp_id or subdir_name
 
             # Prefer the exact files Cavalry reported for this composition;
             # fall back to the folder/name heuristic only if the manifest
@@ -189,24 +234,35 @@ class ExtractMultiCompLocalRender(publish.Extractor):
             )
             if not files:
                 output_dir, files = comp_outputs.get(subdir_name, (None, []))
-            if not files:
-                self.log.warning(
-                    "No render output matched comp %s under %s",
-                    comp_name or comp_id,
-                    candidate_dirs,
-                )
-                continue
+            collected.append({
+                "label": label,
+                "files": files,
+                "output_dir": output_dir,
+                "subdir_name": subdir_name,
+                "comp_id": comp_id,
+                "idx": idx,
+            })
 
+        incomplete = incomplete_comp_output_message(
+            [(item["label"], len(item["files"])) for item in collected]
+        )
+        if incomplete:
+            self.log.error(incomplete)
+            raise publish.PublishError(incomplete)
+
+        representations = []
+        used_repre_names = set()
+        for item in collected:
             representations.extend(
                 self._build_representations_for_files(
-                    files=files,
-                    output_dir=output_dir,
-                    base_name=subdir_name,
-                    comp_id=comp_id,
+                    files=item["files"],
+                    output_dir=item["output_dir"],
+                    base_name=item["subdir_name"],
+                    comp_id=item["comp_id"],
                     comp_settings=comp_settings,
                     mark_review=mark_review,
                     used_repre_names=used_repre_names,
-                    idx=idx,
+                    idx=item["idx"],
                     has_existing_representations=bool(representations),
                 )
             )
@@ -301,15 +357,16 @@ class ExtractMultiCompLocalRender(publish.Extractor):
         """Render the multi-comp item, refreshing (N/Total) while it runs.
 
         The render is a single blocking call on Cavalry's side, so we dispatch
-        it without blocking and poll the manifest (one line appended per comp
-        by the Post-Render Script) to advance the publisher overlay. Falls back
-        to a plain blocking render if the async path is unavailable.
+        it without blocking and poll the manifest (one line appended per
+        render by the Post-Render Script) to advance the publisher overlay.
+        The loop leaves only when Cavalry posts the render result. Stopping
+        early and then reading the disk would publish a partial set. Falls
+        back to a plain blocking render if the async path is unavailable.
         """
-        render_timeout = 3600
         poll_interval = 0.5
 
         if not manifest_enabled or not hasattr(stub, "render_async"):
-            return stub.render(rq_item_id, timeout=render_timeout)
+            return stub.render(rq_item_id, timeout=None)
 
         try:
             cmd_id, event = stub.render_async(rq_item_id)
@@ -317,9 +374,8 @@ class ExtractMultiCompLocalRender(publish.Extractor):
             self.log.warning(
                 "Async render unavailable (%s); falling back to blocking.", exc
             )
-            return stub.render(rq_item_id, timeout=render_timeout)
+            return stub.render(rq_item_id, timeout=None)
 
-        deadline = time.time() + render_timeout
         last_reported = -1
         while not event.wait(poll_interval):
             done = self._count_manifest_entries(manifest_path)
@@ -328,14 +384,8 @@ class ExtractMultiCompLocalRender(publish.Extractor):
                     min(done, total_comps), total_comps
                 )
                 last_reported = done
-            if time.time() > deadline:
-                self.log.warning(
-                    "Render exceeded %ss; stopping progress poll.",
-                    render_timeout,
-                )
-                break
 
-        # Render finished: flush the counter to the full total.
+        # Cavalry reported the render command finished.
         self.label = report_multi_comp_render_progress(total_comps, total_comps)
         return stub.get_command_result(cmd_id)
 
