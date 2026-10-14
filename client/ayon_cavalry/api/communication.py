@@ -738,14 +738,16 @@ class CavalryServerTool:
         """Attach (or clear) a Post-Render Script that records render outputs.
 
         The script runs after every render performed by the Render Queue item
-        (once per target/composition) and appends one JSON line per render to
-        ``manifest_path`` containing the composition layer id and the fully
-        resolved output path. Pass an empty ``manifest_path`` to clear it.
+        (once per target/composition). Each line is written to
+        ``.ayon_render_manifest.jsonl`` in the same folder as that render's
+        resolved output path, not the unresolved Render Queue directory.
+        Pass an empty ``manifest_path`` to clear the script. A non-empty
+        path only enables it.
 
         Args:
             item_id (str): Render Queue Item ID.
-            manifest_path (str): Absolute manifest file path (forward slashes),
-                or empty string to remove the script.
+            manifest_path (str): Non-empty to attach the script, or empty to
+                remove it.
 
         Returns:
             bool: True if the script attribute was set.

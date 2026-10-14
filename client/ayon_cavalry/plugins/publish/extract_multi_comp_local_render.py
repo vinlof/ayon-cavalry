@@ -98,46 +98,20 @@ class ExtractMultiCompLocalRender(publish.Extractor):
     families = ["render.local"]
 
     def process(self, instance):
-        if not instance.data.get("creator_attributes", {}).get("multi_comp"):
+        ctx = self._resolve_multi_comp_collect(instance)
+        if ctx is None:
             return
 
-        rq_item_id = instance.data.get("__layer_id__")
-        if not rq_item_id:
-            self.log.warning("Multi-comp instance has no __layer_id__")
-            instance.data["representations"] = []
-            return
+        candidate_dirs = ctx["candidate_dirs"]
+        manifest_path = ctx["manifest_path"]
+        stub = ctx["stub"]
+        rq_item_id = ctx["rq_item_id"]
+        total_comps = len(ctx["comp_members"])
 
-        stub = get_stub()
-        comp_settings = instance.data.get("comp_settings", {})
-        comp_members = instance.data.get("comp_members", [])
-        members = instance.data.get("members", [])
-        if not comp_members and members:
-            comp_members = [
-                {"comp_id": comp_id, "comp_name": ""}
-                for comp_id in members
-            ]
-
-        current_file = instance.context.data.get("currentFile", "")
-        if not current_file:
-            self.log.error("No current file for multi-comp render")
-            instance.data["representations"] = []
-            return
-
-        work_dir = os.path.normpath(os.path.dirname(current_file))
-        render_dir = os.path.join(work_dir, "render").replace("\\", "/")
-        rq_output_dir = self._get_rq_item_output_dir(stub, rq_item_id)
-
-        candidate_dirs = self._build_collect_roots(
-            work_dir, render_dir, rq_output_dir
-        )
-        if not candidate_dirs:
-            self.log.error(
-                "No render output directory on RQ item %s. "
-                "Set Path in Render Manager before publishing.",
-                rq_item_id,
-            )
-            instance.data["representations"] = []
-            return
+        pre_render_files = {}
+        for directory in candidate_dirs:
+            if os.path.isdir(directory):
+                pre_render_files[directory] = set(_safe_listdir(directory))
 
         self.log.info(
             "Multi-comp render using RQ item %s. Collecting under: %s",
@@ -145,20 +119,13 @@ class ExtractMultiCompLocalRender(publish.Extractor):
             ", ".join(candidate_dirs),
         )
 
-        pre_render_files = {}
-        for directory in candidate_dirs:
-            if os.path.isdir(directory):
-                pre_render_files[directory] = set(_safe_listdir(directory))
-
-        creator_attributes = instance.data.get("creator_attributes", {})
-        mark_review = creator_attributes.get("mark_for_review_mode", "first")
-        total_comps = len(comp_members)
-
         # Deterministic mapping: ask Cavalry to record each render's exact
         # composition + resolved path via a Post-Render Script manifest.
-        manifest_dir = rq_output_dir or render_dir
-        manifest_path = os.path.join(manifest_dir, MANIFEST_NAME)
-        self._remove_manifest(manifest_path)
+        # The script writes that file beside the resolved output, which may
+        # be a version folder under this anchor.
+        manifest_root = os.path.dirname(manifest_path)
+        for stale in self._discover_manifests(manifest_root):
+            self._remove_manifest(stale)
         manifest_enabled = False
         try:
             manifest_enabled = stub.prepare_multi_comp_manifest(
@@ -188,7 +155,10 @@ class ExtractMultiCompLocalRender(publish.Extractor):
             except Exception:
                 pass
 
-        manifest_map = self._read_manifest(manifest_path)
+        written = self._manifests_written_since(manifest_root, render_start)
+        if not written and os.path.isfile(manifest_path):
+            written = [manifest_path]
+        manifest_map = self._read_merged_manifests(written)
         if manifest_map:
             self.log.info(
                 "Render manifest mapped %d composition(s) to exact files",
@@ -199,16 +169,144 @@ class ExtractMultiCompLocalRender(publish.Extractor):
             for directory in self._dirs_from_render_result(render_result):
                 if directory and os.path.isdir(directory):
                     if directory not in pre_render_files:
-                        pre_render_files[directory] = set(_safe_listdir(directory))
+                        pre_render_files[directory] = set(
+                            _safe_listdir(directory)
+                        )
 
         comp_outputs = self._group_new_files_by_comp(
-            comp_members,
-            comp_settings,
+            ctx["comp_members"],
+            ctx["comp_settings"],
             candidate_dirs,
             pre_render_files,
             render_start,
         )
+        self._publish_comp_files(
+            instance,
+            ctx,
+            manifest_map,
+            comp_outputs,
+            ctx["rq_output_dir"] or ctx["render_dir"],
+        )
 
+    def collect_existing_outputs(self, instance):
+        """Publish multi-comp files already on disk. Does not render.
+
+        Keeps ``.ayon_render_manifest.jsonl`` when the last render left one,
+        and only scans the Render Queue item's output folder. The new-file
+        filter is not applied, so files from that render are eligible.
+        """
+        ctx = self._resolve_multi_comp_collect(instance)
+        if ctx is None:
+            return
+
+        output_dir = None
+        for directory in ctx["candidate_dirs"]:
+            if os.path.isdir(directory):
+                output_dir = directory
+                break
+        if not output_dir:
+            message = (
+                "No existing render output directory for RQ item {}."
+                .format(ctx["rq_item_id"])
+            )
+            self.log.error(message)
+            raise publish.PublishError(message)
+
+        self.log.info(
+            "Collecting existing multi-comp frames from %s", output_dir
+        )
+        manifest_map = self._read_merged_manifests(
+            self._latest_manifests(output_dir)
+        )
+        if manifest_map:
+            self.log.info(
+                "Render manifest mapped %d composition(s) to exact files",
+                len(manifest_map),
+            )
+
+        comp_outputs = self._group_new_files_by_comp(
+            ctx["comp_members"],
+            ctx["comp_settings"],
+            [output_dir],
+            {},
+            0,
+        )
+        self._publish_comp_files(
+            instance, ctx, manifest_map, comp_outputs, output_dir
+        )
+
+    def _resolve_multi_comp_collect(self, instance):
+        """Shared setup for a live render and an existing-frames publish.
+
+        Returns ``None`` when this instance is not a multi-comp render, or
+        after an early failure has cleared ``representations``.
+        """
+        if not instance.data.get("creator_attributes", {}).get("multi_comp"):
+            return None
+
+        rq_item_id = instance.data.get("__layer_id__")
+        if not rq_item_id:
+            self.log.warning("Multi-comp instance has no __layer_id__")
+            instance.data["representations"] = []
+            return None
+
+        stub = get_stub()
+        comp_settings = instance.data.get("comp_settings", {})
+        comp_members = instance.data.get("comp_members", [])
+        members = instance.data.get("members", [])
+        if not comp_members and members:
+            comp_members = [
+                {"comp_id": comp_id, "comp_name": ""}
+                for comp_id in members
+            ]
+
+        current_file = instance.context.data.get("currentFile", "")
+        if not current_file:
+            self.log.error("No current file for multi-comp render")
+            instance.data["representations"] = []
+            return None
+
+        work_dir = os.path.normpath(os.path.dirname(current_file))
+        render_dir = os.path.join(work_dir, "render").replace("\\", "/")
+        rq_output_dir = self._get_rq_item_output_dir(stub, rq_item_id)
+        candidate_dirs = self._build_collect_roots(
+            work_dir, render_dir, rq_output_dir
+        )
+        if not candidate_dirs:
+            self.log.error(
+                "No render output directory on RQ item %s. "
+                "Set Path in Render Manager before publishing.",
+                rq_item_id,
+            )
+            instance.data["representations"] = []
+            return None
+
+        creator_attributes = instance.data.get("creator_attributes", {})
+        manifest_dir = rq_output_dir or render_dir
+        return {
+            "stub": stub,
+            "rq_item_id": rq_item_id,
+            "comp_settings": comp_settings,
+            "comp_members": comp_members,
+            "members": members,
+            "render_dir": render_dir,
+            "rq_output_dir": rq_output_dir,
+            "candidate_dirs": candidate_dirs,
+            "mark_review": creator_attributes.get(
+                "mark_for_review_mode", "first"
+            ),
+            "manifest_path": os.path.join(manifest_dir, MANIFEST_NAME),
+        }
+
+    def _publish_comp_files(
+        self, instance, ctx, manifest_map, comp_outputs, staging_dir
+    ):
+        """Map collected files to representations and reject a partial set."""
+        comp_members = ctx["comp_members"]
+        members = ctx["members"]
+        comp_settings = ctx["comp_settings"]
+        mark_review = ctx["mark_review"]
+        total_comps = len(comp_members)
         collected = []
         for idx, comp_member in enumerate(comp_members):
             self.label = report_multi_comp_render_progress(
@@ -275,8 +373,7 @@ class ExtractMultiCompLocalRender(publish.Extractor):
             )
         instance.data["representations"] = representations
         if representations:
-            staging = rq_output_dir or render_dir
-            instance.data["stagingDir"] = staging
+            instance.data["stagingDir"] = staging_dir
 
         self.log.info(
             "Collected %d representation(s) from multi-comp render",
@@ -378,7 +475,9 @@ class ExtractMultiCompLocalRender(publish.Extractor):
 
         last_reported = -1
         while not event.wait(poll_interval):
-            done = self._count_manifest_entries(manifest_path)
+            done = self._count_discovered_manifest_entries(
+                os.path.dirname(manifest_path)
+            )
             if 0 < done != last_reported:
                 self.label = report_multi_comp_render_progress(
                     min(done, total_comps), total_comps
@@ -398,6 +497,78 @@ class ExtractMultiCompLocalRender(publish.Extractor):
                 return sum(1 for line in handle if line.strip())
         except OSError:
             return 0
+
+    def _count_discovered_manifest_entries(self, root):
+        """Count manifest lines beside outputs under ``root``."""
+        return sum(
+            self._count_manifest_entries(path)
+            for path in self._discover_manifests(root)
+        )
+
+    def _discover_manifests(self, root):
+        """Manifest files in ``root`` and its immediate child folders.
+
+        Cavalry writes the manifest next to the resolved output. That folder
+        is often a version directory under the work ``render`` folder, so the
+        file is not always beside the Render Queue path itself.
+        """
+        if not root or not os.path.isdir(root):
+            return []
+        found = []
+        direct = os.path.join(root, MANIFEST_NAME)
+        if os.path.isfile(direct):
+            found.append(direct)
+        for name in _safe_listdir(root):
+            child = os.path.join(root, name, MANIFEST_NAME)
+            if os.path.isfile(child):
+                found.append(child)
+        return found
+
+    def _manifests_written_since(self, root, started):
+        """Manifests under ``root`` touched during this render."""
+        fresh = []
+        for path in self._discover_manifests(root):
+            try:
+                if os.path.getmtime(path) >= started - 2:
+                    fresh.append(path)
+            except OSError:
+                continue
+        return fresh
+
+    def _latest_manifests(self, root):
+        """Manifests from the most recent write under ``root``."""
+        found = self._discover_manifests(root)
+        if not found:
+            return []
+        newest = None
+        for path in found:
+            try:
+                mtime = os.path.getmtime(path)
+            except OSError:
+                continue
+            if newest is None or mtime > newest:
+                newest = mtime
+        if newest is None:
+            return []
+        latest = []
+        for path in found:
+            try:
+                if os.path.getmtime(path) >= newest - 2:
+                    latest.append(path)
+            except OSError:
+                continue
+        return latest
+
+    def _read_merged_manifests(self, paths):
+        """Combine manifest files into one ``{comp_id: [paths]}`` map."""
+        merged = {}
+        for path in paths:
+            for comp_id, files in self._read_manifest(path).items():
+                bucket = merged.setdefault(comp_id, [])
+                for file_path in files:
+                    if file_path not in bucket:
+                        bucket.append(file_path)
+        return merged
 
     def _remove_manifest(self, manifest_path):
         """Delete a stale manifest from a previous publish (best-effort)."""

@@ -750,14 +750,22 @@ function executeCommand(cmd) {
                 var manifestPath = (cmd.args.manifest_path || "").replace(/\\/g, "/");
                 var expr = "";
                 if (manifestPath) {
+                    // Write beside the resolved output. The RQ path is often
+                    // the work render folder, while Cavalry puts the files in
+                    // a version subfolder under it.
                     expr =
                         "try{" +
-                        "var __mp=" + JSON.stringify(manifestPath) + ";" +
+                        "var __out=String(render.path||\"\").replace(/\\\\/g,\"/\");" +
+                        "var __slash=__out.lastIndexOf(\"/\");" +
+                        "if(__slash>=0){" +
+                        "var __mp=__out.substring(0,__slash)+" +
+                        "\"/.ayon_render_manifest.jsonl\";" +
                         "var __e=JSON.stringify(" +
                         "{comp:render.composition,path:render.path});" +
                         "var __o=\"\";try{__o=api.readFromFile(__mp);}" +
                         "catch(e){__o=\"\";}" +
                         "api.writeToFile(__mp,__o+__e+\"\\n\",true);" +
+                        "}" +
                         "}catch(err){}";
                 }
                 var setOk = false;
